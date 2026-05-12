@@ -310,7 +310,8 @@ export class SearchUI {
 
             const results = query.trim()
                 ? await this.searchService.search(query, {
-                    includeText: this.activeFilter === FilterCategory.Text
+                    includeText: this.activeFilter === FilterCategory.All || this.activeFilter === FilterCategory.Text,
+                    textOnly: this.activeFilter === FilterCategory.Text
                 })
                 : await this.searchService.getDefaultItems();
 

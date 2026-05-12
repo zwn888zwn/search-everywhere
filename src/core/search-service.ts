@@ -507,7 +507,7 @@ export class SearchService {
     /**
      * Search for items matching the query
      */
-    public async search(query: string, options: { includeText?: boolean } = {}): Promise<SearchItem[]> {
+    public async search(query: string, options: { includeText?: boolean; textOnly?: boolean } = {}): Promise<SearchItem[]> {
         await this.cacheLoadPromise;
 
         // If nothing indexed yet, refresh
@@ -552,10 +552,21 @@ export class SearchService {
             this.boostRecentlyModifiedItems(results);
         }
         // Apply IDEA-style ranking across labels, paths, symbols, and text matches.
-        this.sortResultsByRelevance(results, query);
+        this.sortResultsByRelevance(results, query, options.textOnly === true);
+
+        if (!options.textOnly) {
+            results = this.moveTextMatchesToBottom(results);
+        }
 
         // Limit to max results
         return results.slice(0, this.config.performance.maxResults);
+    }
+
+    private moveTextMatchesToBottom(results: SearchItem[]): SearchItem[] {
+        const nonTextResults = results.filter(item => item.type !== SearchItemType.TextMatch);
+        const textResults = results.filter(item => item.type === SearchItemType.TextMatch);
+
+        return [...nonTextResults, ...textResults];
     }
 
     private searchPathMatches(query: string, limit: number): SearchItem[] {
@@ -573,7 +584,7 @@ export class SearchService {
             return normalizeSearchText(vscode.workspace.asRelativePath(item.uri)).includes(normalizedQuery);
         });
 
-        this.sortResultsByRelevance(pathMatches, query);
+        this.sortResultsByRelevance(pathMatches, query, false);
 
         return pathMatches.slice(0, limit);
     }
@@ -622,13 +633,13 @@ export class SearchService {
             .slice(0, this.config.performance.maxResults);
     }
 
-    private sortResultsByRelevance(results: SearchItem[], query: string): void {
+    private sortResultsByRelevance(results: SearchItem[], query: string, textOnlyMode: boolean): void {
         const normalizedQuery = normalizeSearchText(query);
         const rawQuery = query.trim().toLowerCase();
 
         results.sort((a, b) => {
-            const rankDiff = this.getResultRank(b, normalizedQuery, rawQuery) -
-                this.getResultRank(a, normalizedQuery, rawQuery);
+            const rankDiff = this.getResultRank(b, normalizedQuery, rawQuery, textOnlyMode) -
+                this.getResultRank(a, normalizedQuery, rawQuery, textOnlyMode);
 
             if (rankDiff !== 0) {
                 return rankDiff;
@@ -638,7 +649,7 @@ export class SearchService {
         });
     }
 
-    private getResultRank(item: SearchItem, normalizedQuery: string, rawQuery: string): number {
+    private getResultRank(item: SearchItem, normalizedQuery: string, rawQuery: string, textOnlyMode: boolean): number {
         const label = item.label || '';
         const labelLower = label.toLowerCase();
         const normalizedLabel = normalizeSearchText(label);
@@ -690,7 +701,11 @@ export class SearchService {
                 break;
 
             case SearchItemType.TextMatch:
-                rank -= 1800;
+                rank -= textOnlyMode ? 1800 : 9000;
+
+                if (this.isLowValueTextMatch(item)) {
+                    rank -= 2500;
+                }
                 break;
 
             case SearchItemType.Command:
@@ -699,6 +714,19 @@ export class SearchService {
         }
 
         return rank;
+    }
+
+    private isLowValueTextMatch(item: SearchItem): boolean {
+        if (item.type !== SearchItemType.TextMatch) {
+            return false;
+        }
+
+        const label = item.label || '';
+        const pathText = this.getItemPathText(item).toLowerCase();
+
+        return label.length > 80 ||
+            pathText.includes('go.sum') ||
+            /[a-z0-9+/=]{40,}/i.test(label);
     }
 
     private getItemPathText(item: SearchItem): string {
