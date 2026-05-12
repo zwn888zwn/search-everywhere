@@ -17,19 +17,19 @@ interface IndexedTextLine {
  * Provides text search results from an in-memory line index built from workspace files.
  */
 export class TextSearchProvider implements SearchProvider {
+    private static readonly CACHE_VERSION = 1;
+
     private indexedLines: IndexedTextLine[] = [];
     private searchResults: TextMatchItem[] = [];
     private isRefreshing: boolean = false;
     private indexSizeBytes: number = 0;
 
+    constructor(private context: vscode.ExtensionContext) {}
+
     /**
      * Text search results are query-specific, so there are no static items for the shared index.
      */
     public async getItems(): Promise<TextMatchItem[]> {
-        if (this.indexedLines.length === 0 && !this.isRefreshing) {
-            await this.refresh();
-        }
-
         return [];
     }
 
@@ -73,6 +73,7 @@ export class TextSearchProvider implements SearchProvider {
             const endTime = performance.now();
 
             Logger.debug(`Indexed ${this.indexedLines.length} text lines (${this.indexSizeBytes} bytes) in ${endTime - startTime}ms`);
+            void this.saveCache();
         } catch (error) {
             Logger.debug(`Error refreshing text index: ${error}`);
         } finally {
@@ -92,8 +93,12 @@ export class TextSearchProvider implements SearchProvider {
             return this.searchResults;
         }
 
-        if (this.indexedLines.length === 0 && !this.isRefreshing) {
-            await this.refresh();
+        if (this.indexedLines.length === 0) {
+            if (!this.isRefreshing) {
+                void this.refresh();
+            }
+
+            return [];
         }
 
         const config = getConfiguration();
@@ -134,6 +139,58 @@ export class TextSearchProvider implements SearchProvider {
      */
     public cancelSearch(): void {
         this.searchResults = [];
+    }
+
+    public async loadCache(): Promise<void> {
+        try {
+            const raw = await vscode.workspace.fs.readFile(this.getCacheUri());
+            const cache = JSON.parse(Buffer.from(raw).toString('utf8')) as CachedTextIndex;
+
+            if (cache.version !== TextSearchProvider.CACHE_VERSION || !Array.isArray(cache.lines)) {
+                return;
+            }
+
+            this.indexedLines = cache.lines.map(line => {
+                const uri = vscode.Uri.parse(line.uri);
+
+                return {
+                    uri,
+                    lineNumber: line.lineNumber,
+                    text: line.text,
+                    label: line.label,
+                    lowerText: line.text.toLowerCase()
+                };
+            });
+            this.indexSizeBytes = cache.indexSizeBytes || 0;
+
+            Logger.debug(`Loaded ${this.indexedLines.length} cached text lines`);
+        } catch (error) {
+            Logger.debug(`No text index cache loaded: ${error}`);
+        }
+    }
+
+    private async saveCache(): Promise<void> {
+        try {
+            const storageUri = this.getStorageUri();
+
+            await vscode.workspace.fs.createDirectory(storageUri);
+
+            const cache: CachedTextIndex = {
+                version: TextSearchProvider.CACHE_VERSION,
+                indexSizeBytes: this.indexSizeBytes,
+                lines: this.indexedLines.map(line => ({
+                    uri: line.uri.toString(),
+                    lineNumber: line.lineNumber,
+                    text: line.text,
+                    label: line.label
+                }))
+            };
+            const content = Buffer.from(JSON.stringify(cache), 'utf8');
+
+            await vscode.workspace.fs.writeFile(this.getCacheUri(), content);
+        } catch (error) {
+            Logger.debug(`Error saving text index cache: ${error}`);
+        }
     }
 
     private async indexFile(uri: vscode.Uri, maxFileSizeBytes: number, maxIndexBytes: number): Promise<void> {
@@ -179,6 +236,14 @@ export class TextSearchProvider implements SearchProvider {
         }
     }
 
+    private getStorageUri(): vscode.Uri {
+        return this.context.storageUri || vscode.Uri.joinPath(this.context.globalStorageUri, 'workspace-cache');
+    }
+
+    private getCacheUri(): vscode.Uri {
+        return vscode.Uri.joinPath(this.getStorageUri(), 'text-index.json');
+    }
+
     private createSearchItem(indexedLine: IndexedTextLine, matchIndex: number, query: string): TextMatchItem {
         const startPos = new vscode.Position(indexedLine.lineNumber, matchIndex);
         const endPos = new vscode.Position(indexedLine.lineNumber, matchIndex + query.trim().length);
@@ -210,6 +275,19 @@ export class TextSearchProvider implements SearchProvider {
             priority: 30
         };
     }
+}
+
+interface CachedTextIndex {
+    version: number;
+    indexSizeBytes: number;
+    lines: CachedTextLine[];
+}
+
+interface CachedTextLine {
+    uri: string;
+    lineNumber: number;
+    text: string;
+    label: string;
 }
 
 function indexedLineOverheadBytes(uri: vscode.Uri): number {

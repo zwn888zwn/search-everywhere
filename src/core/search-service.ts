@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { FuzzySearcher, SearchEverywhereConfig, SearchItem, SearchItemType, SearchProvider } from './types';
+import { CommandSearchItem, FileSearchItem, FuzzySearcher, SearchEverywhereConfig, SearchItem, SearchItemType, SearchProvider, SymbolKindGroup, SymbolSearchItem } from './types';
 import { FileSearchProvider } from '../providers/file-provider';
 import { CommandSearchProvider } from '../providers/command-provider';
 import { DocumentSymbolProvider } from '../providers/document-symbol-provider';
@@ -13,6 +13,8 @@ import { isWorkspaceFile } from '../utils/workspace';
  * Main service for coordinating search functionality
  */
 export class SearchService {
+    private static readonly CACHE_VERSION = 1;
+
     private providers: Map<string, SearchProvider> = new Map();
     private searcher: FuzzySearcher;
     private config: SearchEverywhereConfig;
@@ -20,6 +22,7 @@ export class SearchService {
     private recentlyModifiedFiles: Map<string, number> = new Map(); // Uri -> timestamp
     private activityDebouncer: Debouncer;
     private indexUpdateDebouncer: Debouncer;
+    private cacheLoadPromise: Promise<void>;
 
     /**
      * Initialize the search service
@@ -38,6 +41,8 @@ export class SearchService {
         // Register search providers
         this.registerProviders();
 
+        this.cacheLoadPromise = this.loadIndexCache();
+
         // Listen for configuration changes
         vscode.workspace.onDidChangeConfiguration(e => {
             if (e.affectsConfiguration('searchEverywhere')) {
@@ -50,7 +55,7 @@ export class SearchService {
 
                 // Refresh providers if indexing settings changed
                 if (e.affectsConfiguration('searchEverywhere.indexing')) {
-                    this.refreshIndex();
+                    void this.refreshIndex();
                 }
             }
         });
@@ -62,7 +67,7 @@ export class SearchService {
         this.watchFileChanges();
 
         // Initial index
-        this.refreshIndex();
+        void this.cacheLoadPromise.finally(() => this.refreshIndex());
     }
 
     /**
@@ -89,7 +94,7 @@ export class SearchService {
         this.indexUpdateDebouncer.debounce(() => {
             console.log('Updating search index after file changes...');
             // Pull the latest items from all providers without forcing a full refresh
-            this.updateIndexFromProviders();
+            void this.updateIndexFromProviders();
         });
     }
 
@@ -127,6 +132,7 @@ export class SearchService {
 
         // Update the allItems array with the latest items
         this.allItems = Array.from(deduplicationMap.values());
+        void this.saveIndexCache();
 
         console.log(`Index update completed: ${this.allItems.length} items (after deduplication)`);
     }
@@ -204,7 +210,7 @@ export class SearchService {
 
         // Add text search provider
         if (this.config.indexing.includeText) {
-            this.providers.set('text', new TextSearchProvider());
+            this.providers.set('text', new TextSearchProvider(this.context));
         }
     }
 
@@ -230,6 +236,8 @@ export class SearchService {
                 if (force) {
                     console.log(`Forcing refresh of ${name} provider...`);
                     await provider.refresh();
+                } else if (provider instanceof TextSearchProvider) {
+                    void provider.refresh();
                 }
 
                 const items = await provider.getItems();
@@ -255,6 +263,7 @@ export class SearchService {
 
         // Convert the deduplication map to the array
         this.allItems = Array.from(deduplicationMap.values());
+        void this.saveIndexCache();
 
         console.log(`Indexing completed: ${this.allItems.length} items (after deduplication)`);
     }
@@ -262,6 +271,178 @@ export class SearchService {
     /**
      * Generate a key for deduplicating search items
      */
+    private async loadIndexCache(): Promise<void> {
+        try {
+            const cacheUri = this.getCacheUri('search-index.json');
+            const raw = await vscode.workspace.fs.readFile(cacheUri);
+            const cache = JSON.parse(Buffer.from(raw).toString('utf8')) as CachedSearchIndex;
+
+            if (cache.version === SearchService.CACHE_VERSION && Array.isArray(cache.items)) {
+                this.allItems = cache.items
+                    .map(item => this.deserializeCachedItem(item))
+                    .filter((item): item is SearchItem => item !== undefined);
+
+                if (Array.isArray(cache.recentFiles)) {
+                    this.recentlyModifiedFiles = new Map(cache.recentFiles);
+                }
+            }
+
+            console.log(`Loaded ${this.allItems.length} cached search items`);
+        } catch (error) {
+            console.log(`No search index cache loaded: ${error}`);
+        }
+
+        const textProvider = this.providers.get('text');
+
+        if (textProvider instanceof TextSearchProvider) {
+            await textProvider.loadCache();
+        }
+    }
+
+    private async saveIndexCache(): Promise<void> {
+        try {
+            const storageUri = this.getStorageUri();
+
+            await vscode.workspace.fs.createDirectory(storageUri);
+
+            const cache: CachedSearchIndex = {
+                version: SearchService.CACHE_VERSION,
+                items: this.allItems
+                    .map(item => this.serializeItem(item))
+                    .filter((item): item is CachedSearchItem => item !== undefined),
+                recentFiles: [...this.recentlyModifiedFiles.entries()]
+            };
+            const content = Buffer.from(JSON.stringify(cache), 'utf8');
+
+            await vscode.workspace.fs.writeFile(this.getCacheUri('search-index.json'), content);
+        } catch (error) {
+            console.error('Error saving search index cache:', error);
+        }
+    }
+
+    private getStorageUri(): vscode.Uri {
+        return this.context.storageUri || vscode.Uri.joinPath(this.context.globalStorageUri, 'workspace-cache');
+    }
+
+    private getCacheUri(fileName: string): vscode.Uri {
+        return vscode.Uri.joinPath(this.getStorageUri(), fileName);
+    }
+
+    private serializeItem(item: SearchItem): CachedSearchItem | undefined {
+        const baseItem = {
+            id: item.id,
+            label: item.label,
+            description: item.description,
+            detail: item.detail,
+            type: item.type,
+            priority: item.priority
+        };
+
+        if (item.type === SearchItemType.File && 'uri' in item && item.uri instanceof vscode.Uri) {
+            return {
+                ...baseItem,
+                uri: item.uri.toString()
+            };
+        }
+
+        if ((item.type === SearchItemType.Symbol || item.type === SearchItemType.Class) &&
+            'uri' in item &&
+            item.uri instanceof vscode.Uri &&
+            'range' in item &&
+            item.range instanceof vscode.Range) {
+            const symbolItem = item as SymbolSearchItem;
+
+            return {
+                ...baseItem,
+                uri: symbolItem.uri.toString(),
+                range: serializeRange(symbolItem.range),
+                symbolKind: symbolItem.symbolKind,
+                symbolGroup: symbolItem.symbolGroup
+            };
+        }
+
+        if (item.type === SearchItemType.Command && 'command' in item) {
+            const commandItem = item as CommandSearchItem;
+
+            return {
+                ...baseItem,
+                command: commandItem.command,
+                args: commandItem.args
+            };
+        }
+
+        return undefined;
+    }
+
+    private deserializeCachedItem(item: CachedSearchItem): SearchItem | undefined {
+        if (item.type === SearchItemType.File && item.uri) {
+            const uri = vscode.Uri.parse(item.uri);
+            const fileItem: FileSearchItem = {
+                id: item.id,
+                label: item.label,
+                description: item.description,
+                detail: item.detail,
+                type: SearchItemType.File,
+                uri,
+                iconPath: new vscode.ThemeIcon('file'),
+                priority: item.priority,
+                action: async () => {
+                    await vscode.window.showTextDocument(uri);
+                }
+            };
+
+            return fileItem;
+        }
+
+        if ((item.type === SearchItemType.Symbol || item.type === SearchItemType.Class) && item.uri && item.range && item.symbolKind !== undefined) {
+            const uri = vscode.Uri.parse(item.uri);
+            const range = deserializeRange(item.range);
+            const symbolItem: SymbolSearchItem = {
+                id: item.id,
+                label: item.label,
+                description: item.description,
+                detail: item.detail,
+                type: item.type,
+                uri,
+                range,
+                symbolKind: item.symbolKind,
+                symbolGroup: item.symbolGroup,
+                priority: item.priority,
+                iconPath: new vscode.ThemeIcon(item.type === SearchItemType.Class ? 'symbol-class' : 'symbol-method'),
+                action: async () => {
+                    const document = await vscode.workspace.openTextDocument(uri);
+                    const editor = await vscode.window.showTextDocument(document);
+
+                    editor.selection = new vscode.Selection(range.start, range.start);
+                    editor.revealRange(range, vscode.TextEditorRevealType.InCenter);
+                }
+            };
+
+            return symbolItem;
+        }
+
+        if (item.type === SearchItemType.Command && item.command) {
+            const commandItem: CommandSearchItem = {
+                id: item.id,
+                label: item.label,
+                description: item.description,
+                detail: item.detail,
+                type: SearchItemType.Command,
+                command: item.command,
+                args: item.args,
+                priority: item.priority,
+                iconPath: new vscode.ThemeIcon('terminal-bash'),
+                action: async () => {
+                    await vscode.commands.executeCommand(item.command!, ...(item.args || []));
+                }
+            };
+
+            return commandItem;
+        }
+
+        return undefined;
+    }
+
     private getDeduplicationKey(item: SearchItem): string {
         // Normalize the label by removing parentheses from method names
         const normalizedLabel = item.label.replace(/\(\)$/, '');
@@ -296,6 +477,8 @@ export class SearchService {
      * Search for items matching the query
      */
     public async search(query: string, options: { includeText?: boolean } = {}): Promise<SearchItem[]> {
+        await this.cacheLoadPromise;
+
         // If nothing indexed yet, refresh
         if (this.allItems.length === 0) {
             await this.refreshIndex();
@@ -340,6 +523,36 @@ export class SearchService {
 
         // Limit to max results
         return results.slice(0, this.config.performance.maxResults);
+    }
+
+    /**
+     * Get useful items for an empty query, similar to a recent files list.
+     */
+    public async getDefaultItems(): Promise<SearchItem[]> {
+        await this.cacheLoadPromise;
+
+        if (this.allItems.length === 0) {
+            await this.refreshIndex();
+        }
+
+        const fileItems = this.allItems.filter((item): item is FileSearchItem =>
+            item.type === SearchItemType.File &&
+            'uri' in item &&
+            item.uri instanceof vscode.Uri
+        );
+        const recentFileItems = fileItems
+            .filter(item => this.recentlyModifiedFiles.has(item.uri.toString()))
+            .sort((a, b) => {
+                return (this.recentlyModifiedFiles.get(b.uri.toString()) || 0) -
+                    (this.recentlyModifiedFiles.get(a.uri.toString()) || 0);
+            });
+        const recentIds = new Set(recentFileItems.map(item => item.id));
+        const fallbackFileItems = fileItems
+            .filter(item => !recentIds.has(item.id))
+            .sort((a, b) => a.label.localeCompare(b.label));
+
+        return [...recentFileItems, ...fallbackFileItems]
+            .slice(0, this.config.performance.maxResults);
     }
 
     /**
@@ -434,4 +647,56 @@ export class SearchService {
 
         return benchmarks;
     }
+}
+
+interface CachedSearchIndex {
+    version: number;
+    items: CachedSearchItem[];
+    recentFiles?: Array<[string, number]>;
+}
+
+interface CachedSearchItem {
+    id: string;
+    label: string;
+    description: string;
+    detail: string;
+    type: SearchItemType;
+    priority?: number;
+    uri?: string;
+    range?: CachedRange;
+    symbolKind?: vscode.SymbolKind;
+    symbolGroup?: SymbolKindGroup;
+    command?: string;
+    args?: any[];
+}
+
+interface CachedRange {
+    start: {
+        line: number;
+        character: number;
+    };
+    end: {
+        line: number;
+        character: number;
+    };
+}
+
+function serializeRange(range: vscode.Range): CachedRange {
+    return {
+        start: {
+            line: range.start.line,
+            character: range.start.character
+        },
+        end: {
+            line: range.end.line,
+            character: range.end.character
+        }
+    };
+}
+
+function deserializeRange(range: CachedRange): vscode.Range {
+    return new vscode.Range(
+        new vscode.Position(range.start.line, range.start.character),
+        new vscode.Position(range.end.line, range.end.character)
+    );
 }

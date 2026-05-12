@@ -19,6 +19,8 @@ export enum FilterCategory {
  * Manages the VSCode UI for search everywhere
  */
 export class SearchUI {
+    private static readonly LAST_QUERY_KEY = 'searchEverywhere.lastQuery';
+
     private quickPick: vscode.QuickPick<SearchQuickPickItem>;
     private searchDebounce: NodeJS.Timeout | undefined;
     private lastQuery: string = '';
@@ -38,7 +40,7 @@ export class SearchUI {
     /**
      * Initialize the search UI
      */
-    constructor(private searchService: SearchService) {
+    constructor(private searchService: SearchService, private context: vscode.ExtensionContext) {
         // Create quick pick UI
         this.quickPick = vscode.window.createQuickPick<SearchQuickPickItem>();
         this.quickPick.placeholder = 'Type to search everywhere (files, classes, symbols...)';
@@ -160,9 +162,9 @@ export class SearchUI {
         if (this.activeFilter !== FilterCategory.All) {
             const activeFilterName = this.activeFilter.charAt(0).toUpperCase() + this.activeFilter.slice(1);
 
-            this.quickPick.placeholder = `Searching in ${activeFilterName} only. Type to search...`;
+            this.quickPick.placeholder = `${activeFilterName} only`;
         } else {
-            this.quickPick.placeholder = 'Type to search everywhere (files, classes, symbols...)';
+            this.quickPick.placeholder = 'Search files, types, symbols, actions, and text';
         }
     }
 
@@ -242,8 +244,7 @@ export class SearchUI {
         if (this.activeFilter === FilterCategory.All) {
             this.quickPick.title = 'Search Everywhere';
         } else {
-            // Use special characters for emphasis since codicons don't work in title
-            this.quickPick.title = `⟪ ${filterName} ⟫`;
+            this.quickPick.title = `Search Everywhere - ${filterName}`;
         }
     }
 
@@ -254,9 +255,10 @@ export class SearchUI {
         // Always reset to "All" filter when opening
         this.activeFilter = FilterCategory.All;
 
-        // Clear any previous search query
-        this.quickPick.value = '';
-        this.lastQuery = '';
+        const initialQuery = this.context.workspaceState.get<string>(SearchUI.LAST_QUERY_KEY, '');
+
+        this.quickPick.value = initialQuery;
+        this.lastQuery = initialQuery;
 
         // Refresh configuration
         this.config = getConfiguration();
@@ -270,8 +272,7 @@ export class SearchUI {
         // Show the quick pick
         this.quickPick.show();
 
-        // When opened with no query, show most-used items
-        this.performSearch('');
+        this.performSearch(initialQuery);
     }
 
     /**
@@ -289,6 +290,7 @@ export class SearchUI {
         }
 
         this.lastQuery = value;
+        this.saveLastQuery(value);
 
         // Show "Searching..." when query changes
         this.quickPick.busy = true;
@@ -306,10 +308,11 @@ export class SearchUI {
         try {
             this.quickPick.busy = true;
 
-            // Text is backed by its own in-memory index, so All can include it without scanning files.
-            const results = await this.searchService.search(query, {
-                includeText: this.activeFilter === FilterCategory.All || this.activeFilter === FilterCategory.Text
-            });
+            const results = query.trim()
+                ? await this.searchService.search(query, {
+                    includeText: this.activeFilter === FilterCategory.All || this.activeFilter === FilterCategory.Text
+                })
+                : await this.searchService.getDefaultItems();
 
             // Apply category filters
             const filteredResults = this.applyCategoryFilter(results);
@@ -326,6 +329,16 @@ export class SearchUI {
         } finally {
             this.quickPick.busy = false;
         }
+    }
+
+    private saveLastQuery(value: string): void {
+        const trimmedValue = value.trim();
+
+        if (!trimmedValue) {
+            return;
+        }
+
+        void this.context.workspaceState.update(SearchUI.LAST_QUERY_KEY, trimmedValue);
     }
 
     /**
@@ -485,10 +498,7 @@ export class SearchUI {
      * Convert a SearchItem to a QuickPickItem
      */
     private createQuickPickItem(item: SearchItem): SearchQuickPickItem {
-        // Enhance the label based on the active filter
-        let label = item.label;
-
-        // Get relative path for description if item has a URI
+        let label = this.formatLabel(item);
         let description = item.description || '';
         let detail = '';
 
@@ -499,17 +509,15 @@ export class SearchUI {
                 // Get the relative path from the workspace root
                 description = vscode.workspace.asRelativePath(item.uri);
 
-                // Add line number for symbols and classes
-                if (('range' in item) &&
-                    (item.type === SearchItemType.Symbol || item.type === SearchItemType.Class)) {
-                    const symbolItem = item as { range: vscode.Range };
-                    const lineNumber = symbolItem.range.start.line + 1; // Convert to 1-based line number
+                if ('range' in item && item.range instanceof vscode.Range) {
+                    const lineNumber = item.range.start.line + 1;
 
                     description = `${description}:${lineNumber}`;
                 }
 
-                // Don't show the absolute path in the detail field
-                // We'll keep detail empty or use it for other information
+                if (item.type === SearchItemType.Symbol || item.type === SearchItemType.Class) {
+                    detail = item.description || '';
+                }
             }
         } else {
             // For non-file items, keep the original detail
@@ -524,6 +532,45 @@ export class SearchUI {
             originalItem: item,
             type: item.type
         };
+    }
+
+    private formatLabel(item: SearchItem): string {
+        if (item.type !== SearchItemType.TextMatch) {
+            return item.label;
+        }
+
+        const textItem = item as SearchItem & { lineText?: string };
+        const lineText = (textItem.lineText || item.label).trim();
+        const query = this.lastQuery.trim();
+
+        if (!query) {
+            return this.truncateMiddle(lineText, 120);
+        }
+
+        const matchIndex = lineText.toLowerCase().indexOf(query.toLowerCase());
+
+        if (matchIndex === -1 || lineText.length <= 120) {
+            return this.truncateMiddle(lineText, 120);
+        }
+
+        const contextBefore = 32;
+        const contextAfter = 88;
+        const start = Math.max(0, matchIndex - contextBefore);
+        const end = Math.min(lineText.length, matchIndex + query.length + contextAfter);
+        const prefix = start > 0 ? '...' : '';
+        const suffix = end < lineText.length ? '...' : '';
+
+        return `${prefix}${lineText.substring(start, end)}${suffix}`;
+    }
+
+    private truncateMiddle(text: string, maxLength: number): string {
+        if (text.length <= maxLength) {
+            return text;
+        }
+
+        const half = Math.floor((maxLength - 3) / 2);
+
+        return `${text.substring(0, half)}...${text.substring(text.length - half)}`;
     }
 
     /**

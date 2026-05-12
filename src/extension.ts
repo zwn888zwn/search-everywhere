@@ -17,7 +17,7 @@ export function activate(context: vscode.ExtensionContext) {
 	const searchService = new SearchService(context);
 
 	// Create the search UI
-	const searchUI = new SearchUI(searchService);
+	const searchUI = new SearchUI(searchService, context);
 
 	// Register search command
 	const searchDisposable = vscode.commands.registerCommand('search-everywhere.search', () => {
