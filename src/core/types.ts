@@ -148,6 +148,8 @@ export interface SearchEverywhereConfig {
     performance: {
         maxResults: number;
         maxTextResults: number;
+        maxTextFileSizeBytes: number;
+        maxTextIndexBytes: number;
     };
     fuzzySearch: {
         library: string;

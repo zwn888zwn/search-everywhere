@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import { SearchItemType, SearchProvider, SymbolKindGroup, SymbolSearchItem, mapSymbolKindToGroup } from '../core/types';
 import { Debouncer } from '../utils/debouncer';
 import { ExclusionPatterns } from '../utils/exclusions';
+import { isWorkspaceFile } from '../utils/workspace';
 
 /**
  * Provides document symbols for searching by scanning each file individually
@@ -43,6 +44,10 @@ export class DocumentSymbolProvider implements SearchProvider {
      */
     private async updateDocumentSymbols(document: vscode.TextDocument): Promise<void> {
         const uri = document.uri;
+
+        if (!isWorkspaceFile(uri)) {
+            return;
+        }
 
         // Skip files that should be excluded
         if (ExclusionPatterns.shouldExclude(uri)) {
@@ -185,7 +190,7 @@ export class DocumentSymbolProvider implements SearchProvider {
         for (const uri of files) {
             try {
                 // Skip files that should be excluded
-                if (ExclusionPatterns.shouldExclude(uri)) {
+                if (!isWorkspaceFile(uri) || ExclusionPatterns.shouldExclude(uri)) {
                     continue;
                 }
 

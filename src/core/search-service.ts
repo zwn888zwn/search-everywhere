@@ -2,12 +2,12 @@ import * as vscode from 'vscode';
 import { FuzzySearcher, SearchEverywhereConfig, SearchItem, SearchItemType, SearchProvider } from './types';
 import { FileSearchProvider } from '../providers/file-provider';
 import { CommandSearchProvider } from '../providers/command-provider';
-import { SymbolSearchProvider } from '../providers/symbol-provider';
 import { DocumentSymbolProvider } from '../providers/document-symbol-provider';
 import { TextSearchProvider } from '../providers/text-provider';
 import { getConfiguration } from '../utils/config';
 import { SearchFactory } from '../search/search-factory';
 import { Debouncer } from '../utils/debouncer';
+import { isWorkspaceFile } from '../utils/workspace';
 
 /**
  * Main service for coordinating search functionality
@@ -110,6 +110,10 @@ export class SearchService {
 
                 // Deduplicate items as they come in
                 for (const item of items) {
+                    if (!this.isWorkspaceScopedItem(item)) {
+                        continue;
+                    }
+
                     const dedupeKey = this.getDeduplicationKey(item);
 
                     if (!deduplicationMap.has(dedupeKey)) {
@@ -148,6 +152,10 @@ export class SearchService {
      * Track document activity
      */
     private trackDocumentActivity(uri: vscode.Uri): void {
+        if (!isWorkspaceFile(uri)) {
+            return;
+        }
+
         this.activityDebouncer.debounce(() => {
             // Record the timestamp when this file was accessed
             this.recentlyModifiedFiles.set(uri.toString(), Date.now());
@@ -165,6 +173,17 @@ export class SearchService {
     }
 
     /**
+     * Keep file-backed search results limited to the current workspace.
+     */
+    private isWorkspaceScopedItem(item: SearchItem): boolean {
+        if ('uri' in item && item.uri instanceof vscode.Uri) {
+            return isWorkspaceFile(item.uri);
+        }
+
+        return true;
+    }
+
+    /**
      * Register all search providers
      */
     private registerProviders(): void {
@@ -175,7 +194,6 @@ export class SearchService {
 
         // Add symbol providers
         if (this.config.indexing.includeSymbols) {
-            this.providers.set('symbols', new SymbolSearchProvider());
             this.providers.set('docSymbols', new DocumentSymbolProvider());
         }
 
@@ -220,6 +238,10 @@ export class SearchService {
 
                 // Deduplicate items as they come in
                 for (const item of items) {
+                    if (!this.isWorkspaceScopedItem(item)) {
+                        continue;
+                    }
+
                     const dedupeKey = this.getDeduplicationKey(item);
 
                     if (!deduplicationMap.has(dedupeKey)) {
@@ -273,15 +295,20 @@ export class SearchService {
     /**
      * Search for items matching the query
      */
-    public async search(query: string): Promise<SearchItem[]> {
+    public async search(query: string, options: { includeText?: boolean } = {}): Promise<SearchItem[]> {
         // If nothing indexed yet, refresh
         if (this.allItems.length === 0) {
             await this.refreshIndex();
         }
+
+        if (!query.trim()) {
+            return [];
+        }
+
         let results: SearchItem[] = [];
 
-        // Get text search results if enabled (these are always on-demand)
-        if (this.config.indexing.includeText && query.trim()) {
+        // Text search uses its own in-memory line index, so include it only for filters that need it.
+        if (this.config.indexing.includeText && options.includeText) {
             try {
                 const textProvider = this.providers.get('text') as TextSearchProvider;
 
@@ -294,15 +321,7 @@ export class SearchService {
                 console.error('Error performing text search:', error);
             }
         }
-        // If no query, return all indexed items
-        if (!query.trim()) {
-            // Sort by priority for empty queries
-            const sortedItems = [...this.allItems];
 
-            this.sortResultsByPriority(sortedItems);
-
-            return sortedItems.slice(0, this.config.performance.maxResults);
-        }
         // Perform fuzzy search on indexed items
         const fuzzyResults = await this.searcher.search(
             this.allItems,

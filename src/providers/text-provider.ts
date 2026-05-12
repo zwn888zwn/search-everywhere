@@ -1,252 +1,217 @@
 import * as vscode from 'vscode';
 import { SearchItemType, SearchProvider, TextMatchItem } from '../core/types';
+import { getConfiguration } from '../utils/config';
 import { ExclusionPatterns } from '../utils/exclusions';
 import Logger from '../utils/logging';
+import { isWorkspaceFile } from '../utils/workspace';
 
-/**
- * Interface for text search results
- */
-interface TextSearchMatch {
+interface IndexedTextLine {
     uri: vscode.Uri;
-    range: vscode.Range;
-    preview: {
-        text: string;
-        matches?: Array<{ text: string }>;
-    };
+    lineNumber: number;
+    text: string;
+    label: string;
+    lowerText: string;
 }
 
 /**
- * Provides text search results from file contents
+ * Provides text search results from an in-memory line index built from workspace files.
  */
 export class TextSearchProvider implements SearchProvider {
-    private isSearching: boolean = false;
-    private lastQuery: string = '';
+    private indexedLines: IndexedTextLine[] = [];
     private searchResults: TextMatchItem[] = [];
-    private searchCancellation: vscode.CancellationTokenSource | null = null;
-
-    constructor() {
-        // No indexing needed, searches are performed on demand
-    }
+    private isRefreshing: boolean = false;
+    private indexSizeBytes: number = 0;
 
     /**
-     * Get the current search results
+     * Text search results are query-specific, so there are no static items for the shared index.
      */
     public async getItems(): Promise<TextMatchItem[]> {
-        return this.searchResults;
+        if (this.indexedLines.length === 0 && !this.isRefreshing) {
+            await this.refresh();
+        }
+
+        return [];
     }
 
     /**
-     * Refresh implementation (required by SearchProvider interface)
-     * For text search, refreshing does nothing as searches are on-demand
+     * Build the text index once from files in the current workspace.
      */
     public async refresh(): Promise<void> {
-        // Text searches are performed on demand, so no need to refresh
-        this.searchResults = [];
+        if (this.isRefreshing) {
+            return;
+        }
 
-        return Promise.resolve();
+        this.isRefreshing = true;
+        this.indexedLines = [];
+        this.searchResults = [];
+        this.indexSizeBytes = 0;
+
+        try {
+            if (!vscode.workspace.workspaceFolders || vscode.workspace.workspaceFolders.length === 0) {
+                return;
+            }
+
+            const config = getConfiguration();
+            const excludePattern = ExclusionPatterns.getExclusionGlob();
+            const startTime = performance.now();
+
+            for (const folder of vscode.workspace.workspaceFolders) {
+                const files = await vscode.workspace.findFiles(
+                    new vscode.RelativePattern(folder, '**/*'),
+                    excludePattern
+                );
+
+                for (const uri of files) {
+                    if (this.indexSizeBytes >= config.performance.maxTextIndexBytes) {
+                        break;
+                    }
+
+                    await this.indexFile(uri, config.performance.maxTextFileSizeBytes, config.performance.maxTextIndexBytes);
+                }
+            }
+
+            const endTime = performance.now();
+
+            Logger.debug(`Indexed ${this.indexedLines.length} text lines (${this.indexSizeBytes} bytes) in ${endTime - startTime}ms`);
+        } catch (error) {
+            Logger.debug(`Error refreshing text index: ${error}`);
+        } finally {
+            this.isRefreshing = false;
+        }
     }
 
     /**
-     * Perform a text search with the given query
+     * Search the in-memory text index.
      */
     public async search(query: string): Promise<TextMatchItem[]> {
-        // If query is empty, return empty results
-        if (!query.trim()) {
+        const normalizedQuery = query.trim().toLowerCase();
+
+        if (!normalizedQuery) {
             this.searchResults = [];
 
             return this.searchResults;
         }
 
-        // If we're already searching with the same query, return the current results
-        if (this.isSearching && this.lastQuery === query) {
-            return this.searchResults;
+        if (this.indexedLines.length === 0 && !this.isRefreshing) {
+            await this.refresh();
         }
 
-        // If we're searching with a different query, cancel the current search
-        if (this.isSearching) {
-            this.cancelSearch();
-        }
+        const config = getConfiguration();
+        const maxResults = config.performance.maxResults;
+        const maxTextResultsPerFile = config.performance.maxTextResults;
+        const perFileCounts = new Map<string, number>();
+        const results: TextMatchItem[] = [];
 
-        // Start a new search
-        this.lastQuery = query;
-        this.isSearching = true;
-        this.searchResults = [];
-
-        try {
-            // Create cancellation token for this search
-            this.searchCancellation = new vscode.CancellationTokenSource();
-
-            // Set up the search options
-            const searchOptions = {
-                useIgnoreFiles: true,
-                useGlobalIgnoreFiles: true,
-                maxResults: 1000, // We'll limit the results per file later
-                exclude: this.getExclusionGlobPattern(),
-            };
-
-            // Perform the search
-            Logger.debug(`Starting text search for: ${query}`);
-            const startTime = performance.now();
-
-            // Use VS Code's search API
-            const searchResults = await vscode.workspace.findFiles(
-                '**/*',
-                searchOptions.exclude,
-                searchOptions.maxResults,
-                this.searchCancellation.token
-            );
-
-            // We need to manually search the files
-            for (const uri of searchResults) {
-                if (this.searchCancellation?.token.isCancellationRequested) {
-                    break;
-                }
-
-                await this.searchInFile(uri, query);
+        for (const indexedLine of this.indexedLines) {
+            if (results.length >= maxResults) {
+                break;
             }
 
-            const endTime = performance.now();
+            const matchIndex = indexedLine.lowerText.indexOf(normalizedQuery);
 
-            Logger.debug(`Text search completed in ${endTime - startTime}ms, found ${this.searchResults.length} results`);
+            if (matchIndex === -1) {
+                continue;
+            }
 
-            return this.searchResults;
-        } catch (error) {
-            Logger.debug(`Error performing text search: ${error}`);
+            const uriKey = indexedLine.uri.toString();
+            const fileCount = perFileCounts.get(uriKey) || 0;
 
-            return this.searchResults;
-        } finally {
-            this.isSearching = false;
-            this.searchCancellation = null;
+            if (fileCount >= maxTextResultsPerFile) {
+                continue;
+            }
+
+            perFileCounts.set(uriKey, fileCount + 1);
+            results.push(this.createSearchItem(indexedLine, matchIndex, query));
         }
+
+        this.searchResults = results;
+
+        return this.searchResults;
     }
 
     /**
-     * Search for text within a file
+     * Clear query results. The built text index is kept until refresh rebuilds it.
      */
-    private async searchInFile(uri: vscode.Uri, query: string): Promise<void> {
+    public cancelSearch(): void {
+        this.searchResults = [];
+    }
+
+    private async indexFile(uri: vscode.Uri, maxFileSizeBytes: number, maxIndexBytes: number): Promise<void> {
         try {
-            // Skip excluded files
-            if (ExclusionPatterns.shouldExclude(uri)) {
+            if (!isWorkspaceFile(uri) || ExclusionPatterns.shouldExclude(uri)) {
                 return;
             }
 
-            // Read the file content
+            const stat = await vscode.workspace.fs.stat(uri);
+
+            if (stat.size > maxFileSizeBytes) {
+                return;
+            }
+
             const document = await vscode.workspace.openTextDocument(uri);
-            const text = document.getText();
+            const lines = document.getText().split('\n');
 
-            // Simple search implementation
-            const lines = text.split('\n');
-            const queryLower = query.toLowerCase();
+            for (let lineNumber = 0; lineNumber < lines.length; lineNumber++) {
+                const text = lines[lineNumber];
+                const label = text.trim();
 
-            // Search each line
-            for (let lineIndex = 0; lineIndex < lines.length; lineIndex++) {
-                const line = lines[lineIndex];
-                const lineTextLower = line.toLowerCase();
-
-                // Check if line contains the query
-                if (lineTextLower.includes(queryLower)) {
-                    // Find the character position of the match
-                    const charIndex = lineTextLower.indexOf(queryLower);
-
-                    // Create a range for the match
-                    const startPos = new vscode.Position(lineIndex, charIndex);
-                    const endPos = new vscode.Position(lineIndex, charIndex + query.length);
-                    const range = new vscode.Range(startPos, endPos);
-
-                    // Create a match object
-                    const match: TextSearchMatch = {
-                        uri: uri,
-                        range: range,
-                        preview: {
-                            text: line,
-                            matches: [{ text: line.substring(charIndex, charIndex + query.length) }]
-                        }
-                    };
-
-                    // Process the match
-                    this.processResult(match, query);
+                if (!label) {
+                    continue;
                 }
+
+                const lineSizeBytes = Buffer.byteLength(text, 'utf8') + indexedLineOverheadBytes(uri);
+
+                if (this.indexSizeBytes + lineSizeBytes > maxIndexBytes) {
+                    return;
+                }
+
+                this.indexedLines.push({
+                    uri,
+                    lineNumber,
+                    text,
+                    label,
+                    lowerText: text.toLowerCase()
+                });
+                this.indexSizeBytes += lineSizeBytes;
             }
         } catch (error) {
-            Logger.debug(`Error searching in file ${uri.toString()}: ${error}`);
+            Logger.debug(`Error indexing text file ${uri.toString()}: ${error}`);
         }
     }
 
-    /**
-     * Get a glob pattern string for exclusions
-     */
-    private getExclusionGlobPattern(): string {
-        return ExclusionPatterns.getExclusionGlob();
-    }
+    private createSearchItem(indexedLine: IndexedTextLine, matchIndex: number, query: string): TextMatchItem {
+        const startPos = new vscode.Position(indexedLine.lineNumber, matchIndex);
+        const endPos = new vscode.Position(indexedLine.lineNumber, matchIndex + query.trim().length);
+        const range = new vscode.Range(startPos, endPos);
 
-    /**
-     * Process a search result
-     */
-    private processResult(result: TextSearchMatch, query: string): void {
-        // Skip if not a match
-        if (!result.preview || result.preview.text === undefined) {
-            return;
-        }
-
-        // Skip if this is from an excluded file
-        if (ExclusionPatterns.shouldExclude(result.uri)) {
-            return;
-        }
-
-        // Get the range of the match
-        const range = result.range;
-
-        // Create a search item for this match
-        const searchItem: TextMatchItem = {
-            id: `text-match:${result.uri.toString()}:${range.start.line}:${range.start.character}`,
+        return {
+            id: `text-match:${indexedLine.uri.toString()}:${range.start.line}:${range.start.character}`,
             type: SearchItemType.TextMatch,
-            label: this.formatMatchLabel(result.preview.text, query),
-            description: vscode.workspace.asRelativePath(result.uri),
+            label: indexedLine.label,
+            description: vscode.workspace.asRelativePath(indexedLine.uri),
             detail: `Line ${range.start.line + 1}`,
-            uri: result.uri,
-            range: range,
-            lineText: result.preview.text,
-            matchText: result.preview.matches?.[0]?.text || query,
-            score: 1.0, // Default score
+            uri: indexedLine.uri,
+            range,
+            lineText: indexedLine.text,
+            matchText: indexedLine.text.substring(matchIndex, matchIndex + query.trim().length),
+            score: 1.0,
             action: async () => {
                 try {
-                    const document = await vscode.workspace.openTextDocument(result.uri);
+                    const document = await vscode.workspace.openTextDocument(indexedLine.uri);
                     const editor = await vscode.window.showTextDocument(document);
 
-                    // Reveal the range
                     editor.revealRange(range, vscode.TextEditorRevealType.InCenter);
-
-                    // Select the text
                     editor.selection = new vscode.Selection(range.start, range.end);
                 } catch (error) {
                     Logger.debug(`Error opening text match: ${error}`);
                 }
             },
-            // Icon for text matches
             iconPath: new vscode.ThemeIcon('file-text'),
-            priority: 30 // Lower priority than files and symbols
+            priority: 30
         };
-
-        // Add to results
-        this.searchResults.push(searchItem);
     }
+}
 
-    /**
-     * Format the label for a match to highlight the matched text
-     */
-    private formatMatchLabel(text: string, query: string): string {
-        return text.trim();
-    }
-
-    /**
-     * Cancel any in-progress search
-     */
-    public cancelSearch(): void {
-        if (this.searchCancellation) {
-            this.searchCancellation.cancel();
-            this.searchCancellation.dispose();
-            this.searchCancellation = null;
-        }
-        this.isSearching = false;
-    }
+function indexedLineOverheadBytes(uri: vscode.Uri): number {
+    return Buffer.byteLength(uri.toString(), 'utf8') + 64;
 }

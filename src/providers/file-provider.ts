@@ -96,6 +96,10 @@ export class FileSearchProvider implements SearchProvider {
     private processFileBatch(files: vscode.Uri[], workspaceFolder: vscode.WorkspaceFolder): void {
         for (const uri of files) {
             try {
+                if (ExclusionPatterns.shouldExclude(uri)) {
+                    continue;
+                }
+
                 // Create a relative path for display
                 let relativePath = uri.fsPath;
                 const workspacePath = workspaceFolder.uri.fsPath;

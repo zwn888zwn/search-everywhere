@@ -20,13 +20,15 @@ export function getConfiguration(): SearchEverywhereConfig {
         },
         performance: {
             maxResults: config.get<number>('performance.maxResults', 100),
-            maxTextResults: config.get<number>('performance.maxTextResults', 20)
+            maxTextResults: config.get<number>('performance.maxTextResults', 20),
+            maxTextFileSizeBytes: config.get<number>('performance.maxTextFileSizeBytes', 1048576),
+            maxTextIndexBytes: config.get<number>('performance.maxTextIndexBytes', 20971520)
         },
         fuzzySearch: {
             library: config.get<string>('fuzzySearch.library', 'fuzzysort')
         },
         preview: {
-            enabled: config.get<boolean>('preview.enabled', true)
+            enabled: config.get<boolean>('preview.enabled', false)
         },
         exclusions: config.get<string[]>('exclusions', []),
         debug: config.get<boolean>('debug', false)

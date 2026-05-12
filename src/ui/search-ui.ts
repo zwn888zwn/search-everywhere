@@ -306,8 +306,10 @@ export class SearchUI {
         try {
             this.quickPick.busy = true;
 
-            // Perform search
-            const results = await this.searchService.search(query);
+            // Text is backed by its own in-memory index, so All can include it without scanning files.
+            const results = await this.searchService.search(query, {
+                includeText: this.activeFilter === FilterCategory.All || this.activeFilter === FilterCategory.Text
+            });
 
             // Apply category filters
             const filteredResults = this.applyCategoryFilter(results);

@@ -138,8 +138,23 @@ npm install
 # Compile
 npm run compile
 
-# Package
+# Build production extension files in dist/
 npm run package
+
+# Build an installable VS Code extension package
+npm run vsix
+```
+
+The `npm run vsix` command creates a `.vsix` file in the project root, for example:
+
+```text
+search-everywhere-0.1.5.vsix
+```
+
+Install it manually with:
+
+```bash
+code --install-extension search-everywhere-0.1.5.vsix
 ```
 
 ### Testing the Extension

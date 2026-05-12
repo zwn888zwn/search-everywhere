@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import { SearchItemType, SearchProvider, SymbolKindGroup, SymbolSearchItem, mapSymbolKindToGroup } from '../core/types';
 import { Debouncer } from '../utils/debouncer';
 import { ExclusionPatterns } from '../utils/exclusions';
+import { isWorkspaceFile } from '../utils/workspace';
 
 /**
  * Provides workspace symbols for searching using VSCode's symbol providers
@@ -131,8 +132,9 @@ export class SymbolSearchProvider implements SearchProvider {
 
             console.log(`Found ${allSymbols.length} total workspace symbols (before filtering)`);
 
-            // Filter out symbols from excluded paths
+            // Filter out symbols from files outside the current workspace or excluded paths.
             const filteredSymbols = allSymbols.filter(symbol =>
+                isWorkspaceFile(symbol.location.uri) &&
                 !ExclusionPatterns.shouldExclude(symbol.location.uri)
             );
 
