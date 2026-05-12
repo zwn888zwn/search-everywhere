@@ -41,7 +41,14 @@ export class SearchService {
         // Register search providers
         this.registerProviders();
 
-        this.cacheLoadPromise = this.loadIndexCache();
+        this.cacheLoadPromise = Promise.resolve(vscode.window.withProgress(
+            {
+                location: vscode.ProgressLocation.Notification,
+                title: 'Loading Search Everywhere index...',
+                cancellable: false
+            },
+            async (progress) => this.loadIndexCache(progress)
+        ));
 
         // Listen for configuration changes
         vscode.workspace.onDidChangeConfiguration(e => {
@@ -55,7 +62,7 @@ export class SearchService {
 
                 // Refresh providers if indexing settings changed
                 if (e.affectsConfiguration('searchEverywhere.indexing')) {
-                    void this.refreshIndex();
+                    void this.refreshIndex(false, true);
                 }
             }
         });
@@ -218,13 +225,12 @@ export class SearchService {
      * Refresh all search indexes
      * @param force If true, forces a complete reindex even if the provider is already refreshing
      */
-    public async refreshIndex(force: boolean = false): Promise<void> {
-        // Clear existing items
-        this.allItems = [];
-
-        // Refresh providers based on configuration
-        this.providers.clear();
-        this.registerProviders();
+    public async refreshIndex(force: boolean = false, recreateProviders: boolean = force): Promise<void> {
+        // Refresh providers based on configuration only when the provider set may have changed.
+        if (recreateProviders) {
+            this.providers.clear();
+            this.registerProviders();
+        }
 
         // Temporary map to deduplicate items
         const deduplicationMap = new Map<string, SearchItem>();
@@ -271,10 +277,15 @@ export class SearchService {
     /**
      * Generate a key for deduplicating search items
      */
-    private async loadIndexCache(): Promise<void> {
+    private async loadIndexCache(progress?: vscode.Progress<{ message?: string; increment?: number }>): Promise<void> {
+        progress?.report({ message: 'Reading cached file and symbol index...', increment: 10 });
+
         try {
             const cacheUri = this.getCacheUri('search-index.json');
             const raw = await vscode.workspace.fs.readFile(cacheUri);
+
+            progress?.report({ message: 'Restoring cached file and symbol index...', increment: 45 });
+
             const cache = JSON.parse(Buffer.from(raw).toString('utf8')) as CachedSearchIndex;
 
             if (cache.version === SearchService.CACHE_VERSION && Array.isArray(cache.items)) {
@@ -288,15 +299,35 @@ export class SearchService {
             }
 
             console.log(`Loaded ${this.allItems.length} cached search items`);
+            progress?.report({ message: `Loaded ${this.allItems.length} cached items`, increment: 35 });
         } catch (error) {
             console.log(`No search index cache loaded: ${error}`);
+            progress?.report({ message: 'No cached file and symbol index found', increment: 80 });
         }
 
         const textProvider = this.providers.get('text');
 
         if (textProvider instanceof TextSearchProvider) {
-            await textProvider.loadCache();
+            this.loadTextCacheInBackground(textProvider);
         }
+    }
+
+    private loadTextCacheInBackground(textProvider: TextSearchProvider): void {
+        void vscode.window.withProgress(
+            {
+                location: vscode.ProgressLocation.Notification,
+                title: 'Loading Search Everywhere text cache...',
+                cancellable: false
+            },
+            async (progress) => {
+                progress.report({ message: 'Reading cached text index...', increment: 10 });
+                const lineCount = await textProvider.loadCache((message, increment) => {
+                    progress.report({ message, increment });
+                });
+
+                progress.report({ message: `Loaded ${lineCount} cached text lines`, increment: 100 });
+            }
+        );
     }
 
     private async saveIndexCache(): Promise<void> {

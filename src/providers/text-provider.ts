@@ -141,14 +141,19 @@ export class TextSearchProvider implements SearchProvider {
         this.searchResults = [];
     }
 
-    public async loadCache(): Promise<void> {
+    public async loadCache(reportProgress?: (message: string, increment?: number) => void): Promise<number> {
         try {
             const raw = await vscode.workspace.fs.readFile(this.getCacheUri());
+
+            reportProgress?.('Parsing cached text index...', 35);
+
             const cache = JSON.parse(Buffer.from(raw).toString('utf8')) as CachedTextIndex;
 
             if (cache.version !== TextSearchProvider.CACHE_VERSION || !Array.isArray(cache.lines)) {
-                return;
+                return 0;
             }
+
+            reportProgress?.('Restoring cached text lines...', 40);
 
             this.indexedLines = cache.lines.map(line => {
                 const uri = vscode.Uri.parse(line.uri);
@@ -164,8 +169,12 @@ export class TextSearchProvider implements SearchProvider {
             this.indexSizeBytes = cache.indexSizeBytes || 0;
 
             Logger.debug(`Loaded ${this.indexedLines.length} cached text lines`);
+
+            return this.indexedLines.length;
         } catch (error) {
             Logger.debug(`No text index cache loaded: ${error}`);
+
+            return 0;
         }
     }
 
