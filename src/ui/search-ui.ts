@@ -44,8 +44,8 @@ export class SearchUI {
         // Create quick pick UI
         this.quickPick = vscode.window.createQuickPick<SearchQuickPickItem>();
         this.quickPick.placeholder = 'Type to search everywhere (files, classes, symbols...)';
-        this.quickPick.matchOnDescription = false;
-        this.quickPick.matchOnDetail = false;
+        this.quickPick.matchOnDescription = true;
+        this.quickPick.matchOnDetail = true;
         this.quickPick.ignoreFocusOut = false;
 
         // Create filter category buttons
@@ -310,7 +310,7 @@ export class SearchUI {
 
             const results = query.trim()
                 ? await this.searchService.search(query, {
-                    includeText: this.activeFilter === FilterCategory.All || this.activeFilter === FilterCategory.Text
+                    includeText: this.activeFilter === FilterCategory.Text
                 })
                 : await this.searchService.getDefaultItems();
 

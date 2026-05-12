@@ -13,7 +13,7 @@ import { isWorkspaceFile } from '../utils/workspace';
  * Main service for coordinating search functionality
  */
 export class SearchService {
-    private static readonly CACHE_VERSION = 1;
+    private static readonly CACHE_VERSION = 2;
 
     private providers: Map<string, SearchProvider> = new Map();
     private searcher: FuzzySearcher;
@@ -520,6 +520,7 @@ export class SearchService {
         }
 
         let results: SearchItem[] = [];
+        const queryLimit = Math.min(this.config.performance.maxResults * 5, 1000);
 
         // Text search uses its own in-memory line index, so include it only for filters that need it.
         if (this.config.indexing.includeText && options.includeText) {
@@ -540,20 +541,55 @@ export class SearchService {
         const fuzzyResults = await this.searcher.search(
             this.allItems,
             query,
-            this.config.performance.maxResults
+            queryLimit
         );
+        const pathResults = this.searchPathMatches(query, queryLimit);
 
-        // Combine fuzzy and text results
-        results = [...results, ...fuzzyResults];
+        // Combine fuzzy, explicit path, and optional text results.
+        results = this.deduplicateResults([...results, ...fuzzyResults, ...pathResults]);
         // Boost recently modified files
         if (this.config.activity.enabled && this.recentlyModifiedFiles.size > 0) {
             this.boostRecentlyModifiedItems(results);
         }
-        // Apply priority-based sorting as a tie-breaker
-        this.sortResultsByPriority(results);
+        // Apply IDEA-style ranking across labels, paths, symbols, and text matches.
+        this.sortResultsByRelevance(results, query);
 
         // Limit to max results
         return results.slice(0, this.config.performance.maxResults);
+    }
+
+    private searchPathMatches(query: string, limit: number): SearchItem[] {
+        const normalizedQuery = normalizeSearchText(query);
+
+        if (!normalizedQuery) {
+            return [];
+        }
+
+        const pathMatches = this.allItems.filter(item => {
+            if (!('uri' in item) || !(item.uri instanceof vscode.Uri)) {
+                return false;
+            }
+
+            return normalizeSearchText(vscode.workspace.asRelativePath(item.uri)).includes(normalizedQuery);
+        });
+
+        this.sortResultsByRelevance(pathMatches, query);
+
+        return pathMatches.slice(0, limit);
+    }
+
+    private deduplicateResults(items: SearchItem[]): SearchItem[] {
+        const deduplicationMap = new Map<string, SearchItem>();
+
+        for (const item of items) {
+            const dedupeKey = this.getDeduplicationKey(item);
+
+            if (!deduplicationMap.has(dedupeKey)) {
+                deduplicationMap.set(dedupeKey, item);
+            }
+        }
+
+        return [...deduplicationMap.values()];
     }
 
     /**
@@ -586,27 +622,91 @@ export class SearchService {
             .slice(0, this.config.performance.maxResults);
     }
 
-    /**
-     * Sort search results by score and priority
-     * This ensures that higher priority items (like classes and methods)
-     * appear before lower priority items (like variables) when scores are similar
-     */
-    private sortResultsByPriority(results: SearchItem[]): void {
+    private sortResultsByRelevance(results: SearchItem[], query: string): void {
+        const normalizedQuery = normalizeSearchText(query);
+        const rawQuery = query.trim().toLowerCase();
+
         results.sort((a, b) => {
-            // If both items have scores and they differ significantly
-            if ('score' in a && 'score' in b &&
-                typeof a.score === 'number' && typeof b.score === 'number' &&
-                Math.abs(a.score - b.score) > 0.1) {
-                // Sort by score (higher score first)
-                return b.score - a.score;
+            const rankDiff = this.getResultRank(b, normalizedQuery, rawQuery) -
+                this.getResultRank(a, normalizedQuery, rawQuery);
+
+            if (rankDiff !== 0) {
+                return rankDiff;
             }
 
-            // If scores are similar or not available, use priority as tie-breaker
-            const priorityA = a.priority || 50; // Default priority if not specified
-            const priorityB = b.priority || 50;
-
-            return priorityB - priorityA; // Higher priority first
+            return a.label.localeCompare(b.label);
         });
+    }
+
+    private getResultRank(item: SearchItem, normalizedQuery: string, rawQuery: string): number {
+        const label = item.label || '';
+        const labelLower = label.toLowerCase();
+        const normalizedLabel = normalizeSearchText(label);
+        const pathText = this.getItemPathText(item);
+        const normalizedPath = normalizeSearchText(pathText);
+        let rank = item.priority || 0;
+
+        if (normalizedLabel === normalizedQuery) {
+            rank += 10000;
+        } else if (labelLower === rawQuery) {
+            rank += 9800;
+        } else if (normalizedLabel.startsWith(normalizedQuery)) {
+            rank += 9000;
+        } else {
+            const labelIndex = normalizedLabel.indexOf(normalizedQuery);
+
+            if (labelIndex >= 0) {
+                rank += 7600 - Math.min(labelIndex, 500);
+            }
+        }
+
+        if (normalizedPath === normalizedQuery) {
+            rank += 8200;
+        } else if (normalizedPath.endsWith(normalizedQuery)) {
+            rank += 7000;
+        } else {
+            const pathIndex = normalizedPath.indexOf(normalizedQuery);
+
+            if (pathIndex >= 0) {
+                rank += 5200 - Math.min(pathIndex, 1000);
+            }
+        }
+
+        if (typeof item.score === 'number') {
+            rank += item.score * 100;
+        }
+
+        switch (item.type) {
+            case SearchItemType.Class:
+                rank += 900;
+                break;
+
+            case SearchItemType.Symbol:
+                rank += 800;
+                break;
+
+            case SearchItemType.File:
+                rank += 700;
+                break;
+
+            case SearchItemType.TextMatch:
+                rank -= 1800;
+                break;
+
+            case SearchItemType.Command:
+                rank += 100;
+                break;
+        }
+
+        return rank;
+    }
+
+    private getItemPathText(item: SearchItem): string {
+        if ('uri' in item && item.uri instanceof vscode.Uri) {
+            return `${vscode.workspace.asRelativePath(item.uri)} ${item.detail || ''}`;
+        }
+
+        return `${item.description || ''} ${item.detail || ''}`;
     }
 
     /**
@@ -730,4 +830,8 @@ function deserializeRange(range: CachedRange): vscode.Range {
         new vscode.Position(range.start.line, range.start.character),
         new vscode.Position(range.end.line, range.end.character)
     );
+}
+
+function normalizeSearchText(value: string): string {
+    return value.toLowerCase().replace(/[^a-z0-9]/g, '');
 }

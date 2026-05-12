@@ -57,7 +57,7 @@ export class FileSearchProvider implements SearchProvider {
 
                 // Find all files in the workspace folder
                 const files = await vscode.workspace.findFiles(
-                    new vscode.RelativePattern(folder, '**/*.*'),
+                    new vscode.RelativePattern(folder, '**/*'),
                     excludePattern
                 );
 
