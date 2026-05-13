@@ -8,6 +8,7 @@ import { ExclusionPatterns } from '../utils/exclusions';
 export class FileSearchProvider implements SearchProvider {
     private fileItems: FileSearchItem[] = [];
     private isRefreshing: boolean = false;
+    private isPartial: boolean = false;
 
     constructor() {
         // Listen for changes in workspace files
@@ -20,8 +21,16 @@ export class FileSearchProvider implements SearchProvider {
      * Get all indexed file items
      */
     public async getItems(): Promise<FileSearchItem[]> {
-        if (this.fileItems.length === 0 && !this.isRefreshing) {
+        if ((this.fileItems.length === 0 || this.isPartial) && !this.isRefreshing) {
             await this.refresh();
+        }
+
+        return this.fileItems;
+    }
+
+    public async warmUp(maxFiles: number): Promise<FileSearchItem[]> {
+        if (this.fileItems.length === 0 && !this.isRefreshing) {
+            await this.refresh(maxFiles);
         }
 
         return this.fileItems;
@@ -30,7 +39,7 @@ export class FileSearchProvider implements SearchProvider {
     /**
      * Refresh the file index
      */
-    public async refresh(): Promise<void> {
+    public async refresh(maxFiles?: number): Promise<void> {
         if (this.isRefreshing) {
             return;
         }
@@ -40,6 +49,7 @@ export class FileSearchProvider implements SearchProvider {
         const startTime = performance.now();
 
         this.fileItems = [];
+        this.isPartial = Boolean(maxFiles);
 
         try {
             if (!vscode.workspace.workspaceFolders || vscode.workspace.workspaceFolders.length === 0) {
@@ -58,25 +68,28 @@ export class FileSearchProvider implements SearchProvider {
                 // Find all files in the workspace folder
                 const files = await vscode.workspace.findFiles(
                     new vscode.RelativePattern(folder, '**/*'),
-                    excludePattern
+                    excludePattern,
+                    maxFiles
                 );
 
                 console.log(`Found ${files.length} files in ${folder.name}`);
 
                 // Process files in batches to avoid UI freezes
-                const batchSize = 1000;
+                const batchSize = 500;
+                const shouldRunDeepExclude = files.length <= 5000;
 
                 for (let i = 0; i < files.length; i += batchSize) {
                     const batch = files.slice(i, i + batchSize);
 
-                    this.processFileBatch(batch, folder);
+                    this.processFileBatch(batch, folder, shouldRunDeepExclude);
 
                     // Log progress for large workspaces
                     if (i > 0 && i % 5000 === 0) {
                         console.log(`Processed ${i} files...`);
-                        // Allow UI thread to breathe
-                        await new Promise(resolve => setTimeout(resolve, 0));
                     }
+
+                    // Keep the extension host responsive while indexing large workspaces.
+                    await new Promise(resolve => setTimeout(resolve, 0));
                 }
             }
         } catch (error) {
@@ -93,10 +106,10 @@ export class FileSearchProvider implements SearchProvider {
     /**
      * Process a batch of files
      */
-    private processFileBatch(files: vscode.Uri[], workspaceFolder: vscode.WorkspaceFolder): void {
+    private processFileBatch(files: vscode.Uri[], workspaceFolder: vscode.WorkspaceFolder, shouldRunDeepExclude: boolean): void {
         for (const uri of files) {
             try {
-                if (ExclusionPatterns.shouldExclude(uri)) {
+                if (shouldRunDeepExclude && ExclusionPatterns.shouldExclude(uri)) {
                     continue;
                 }
 

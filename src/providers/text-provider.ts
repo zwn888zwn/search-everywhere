@@ -1,132 +1,68 @@
 import * as vscode from 'vscode';
+import { spawn } from 'child_process';
+import * as fs from 'fs';
+import * as path from 'path';
 import { SearchItemType, SearchProvider, TextMatchItem } from '../core/types';
 import { getConfiguration } from '../utils/config';
 import { ExclusionPatterns } from '../utils/exclusions';
 import Logger from '../utils/logging';
 import { isWorkspaceFile } from '../utils/workspace';
 
-interface IndexedTextLine {
-    uri: vscode.Uri;
-    lineNumber: number;
-    text: string;
-    label: string;
-    lowerText: string;
+interface RgMatch {
+    type: string;
+    data?: {
+        path?: { text?: string };
+        lines?: { text?: string };
+        line_number?: number;
+        submatches?: Array<{
+            match?: { text?: string };
+            start: number;
+            end: number;
+        }>;
+    };
 }
 
 /**
- * Provides text search results from an in-memory line index built from workspace files.
+ * Provides full-text results through ripgrep on demand.
+ *
+ * Search Everywhere should not own a persistent text index. Text is only a
+ * fallback source, so we stream a bounded set of ripgrep matches when needed.
  */
 export class TextSearchProvider implements SearchProvider {
-    private static readonly CACHE_VERSION = 1;
-
-    private indexedLines: IndexedTextLine[] = [];
     private searchResults: TextMatchItem[] = [];
-    private isRefreshing: boolean = false;
-    private indexSizeBytes: number = 0;
+    private currentProcess: ReturnType<typeof spawn> | undefined;
 
-    constructor(private context: vscode.ExtensionContext) {}
-
-    /**
-     * Text search results are query-specific, so there are no static items for the shared index.
-     */
     public async getItems(): Promise<TextMatchItem[]> {
         return [];
     }
 
-    /**
-     * Build the text index once from files in the current workspace.
-     */
     public async refresh(): Promise<void> {
-        if (this.isRefreshing) {
-            return;
-        }
-
-        this.isRefreshing = true;
-        this.indexedLines = [];
         this.searchResults = [];
-        this.indexSizeBytes = 0;
-
-        try {
-            if (!vscode.workspace.workspaceFolders || vscode.workspace.workspaceFolders.length === 0) {
-                return;
-            }
-
-            const config = getConfiguration();
-            const excludePattern = ExclusionPatterns.getExclusionGlob();
-            const startTime = performance.now();
-
-            for (const folder of vscode.workspace.workspaceFolders) {
-                const files = await vscode.workspace.findFiles(
-                    new vscode.RelativePattern(folder, '**/*'),
-                    excludePattern
-                );
-
-                for (const uri of files) {
-                    if (this.indexSizeBytes >= config.performance.maxTextIndexBytes) {
-                        break;
-                    }
-
-                    await this.indexFile(uri, config.performance.maxTextFileSizeBytes, config.performance.maxTextIndexBytes);
-                }
-            }
-
-            const endTime = performance.now();
-
-            Logger.debug(`Indexed ${this.indexedLines.length} text lines (${this.indexSizeBytes} bytes) in ${endTime - startTime}ms`);
-            void this.saveCache();
-        } catch (error) {
-            Logger.debug(`Error refreshing text index: ${error}`);
-        } finally {
-            this.isRefreshing = false;
-        }
     }
 
-    /**
-     * Search the in-memory text index.
-     */
     public async search(query: string): Promise<TextMatchItem[]> {
-        const normalizedQuery = query.trim().toLowerCase();
+        const normalizedQuery = query.trim();
 
-        if (!normalizedQuery) {
+        this.cancelSearch();
+
+        if (!normalizedQuery || !vscode.workspace.workspaceFolders?.length) {
             this.searchResults = [];
 
             return this.searchResults;
         }
 
-        if (this.indexedLines.length === 0) {
-            if (!this.isRefreshing) {
-                void this.refresh();
-            }
-
-            return [];
-        }
-
         const config = getConfiguration();
-        const maxResults = config.performance.maxResults;
-        const maxTextResultsPerFile = config.performance.maxTextResults;
-        const perFileCounts = new Map<string, number>();
+        const maxResults = Math.min(config.performance.maxResults, config.performance.maxTextResults);
         const results: TextMatchItem[] = [];
 
-        for (const indexedLine of this.indexedLines) {
+        for (const folder of vscode.workspace.workspaceFolders) {
             if (results.length >= maxResults) {
                 break;
             }
 
-            const matchIndex = indexedLine.lowerText.indexOf(normalizedQuery);
+            const folderResults = await this.searchFolder(folder, normalizedQuery, maxResults - results.length);
 
-            if (matchIndex === -1) {
-                continue;
-            }
-
-            const uriKey = indexedLine.uri.toString();
-            const fileCount = perFileCounts.get(uriKey) || 0;
-
-            if (fileCount >= maxTextResultsPerFile) {
-                continue;
-            }
-
-            perFileCounts.set(uriKey, fileCount + 1);
-            results.push(this.createSearchItem(indexedLine, matchIndex, query));
+            results.push(...folderResults);
         }
 
         this.searchResults = results;
@@ -134,144 +70,167 @@ export class TextSearchProvider implements SearchProvider {
         return this.searchResults;
     }
 
-    /**
-     * Clear query results. The built text index is kept until refresh rebuilds it.
-     */
     public cancelSearch(): void {
+        if (this.currentProcess) {
+            this.currentProcess.kill();
+            this.currentProcess = undefined;
+        }
+
         this.searchResults = [];
     }
 
     public async loadCache(reportProgress?: (message: string, increment?: number) => void): Promise<number> {
-        try {
-            const raw = await vscode.workspace.fs.readFile(this.getCacheUri());
+        reportProgress?.('Text search uses ripgrep on demand', 100);
 
-            reportProgress?.('Parsing cached text index...', 35);
+        return 0;
+    }
 
-            const cache = JSON.parse(Buffer.from(raw).toString('utf8')) as CachedTextIndex;
-
-            if (cache.version !== TextSearchProvider.CACHE_VERSION || !Array.isArray(cache.lines)) {
-                return 0;
-            }
-
-            reportProgress?.('Restoring cached text lines...', 40);
-
-            this.indexedLines = cache.lines.map(line => {
-                const uri = vscode.Uri.parse(line.uri);
-
-                return {
-                    uri,
-                    lineNumber: line.lineNumber,
-                    text: line.text,
-                    label: line.label,
-                    lowerText: line.text.toLowerCase()
-                };
+    private async searchFolder(folder: vscode.WorkspaceFolder, query: string, limit: number): Promise<TextMatchItem[]> {
+        return new Promise(resolve => {
+            const results: TextMatchItem[] = [];
+            const args = this.buildRgArgs(query);
+            const child = spawn(this.getRgCommand(), args, {
+                cwd: folder.uri.fsPath,
+                windowsHide: true
             });
-            this.indexSizeBytes = cache.indexSizeBytes || 0;
 
-            Logger.debug(`Loaded ${this.indexedLines.length} cached text lines`);
+            this.currentProcess = child;
 
-            return this.indexedLines.length;
-        } catch (error) {
-            Logger.debug(`No text index cache loaded: ${error}`);
+            let buffer = '';
 
-            return 0;
-        }
+            child.stdout.setEncoding('utf8');
+            child.stdout.on('data', chunk => {
+                buffer += chunk;
+                buffer = this.processRgOutput(buffer, folder, query, results, limit);
+
+                if (results.length >= limit) {
+                    child.kill();
+                }
+            });
+
+            child.stderr.setEncoding('utf8');
+            child.stderr.on('data', chunk => {
+                Logger.debug(`ripgrep text search stderr: ${chunk}`);
+            });
+
+            child.on('error', error => {
+                Logger.debug(`ripgrep text search failed: ${error}`);
+                resolve(results);
+            });
+
+            child.on('close', () => {
+                if (this.currentProcess === child) {
+                    this.currentProcess = undefined;
+                }
+
+                if (buffer.trim()) {
+                    this.processRgOutput(`${buffer}\n`, folder, query, results, limit);
+                }
+
+                resolve(results);
+            });
+        });
     }
 
-    private async saveCache(): Promise<void> {
-        try {
-            const storageUri = this.getStorageUri();
+    private getRgCommand(): string {
+        const bundledRg = path.join(vscode.env.appRoot, 'node_modules', '@vscode', 'ripgrep', 'bin', process.platform === 'win32' ? 'rg.exe' : 'rg');
 
-            await vscode.workspace.fs.createDirectory(storageUri);
-
-            const cache: CachedTextIndex = {
-                version: TextSearchProvider.CACHE_VERSION,
-                indexSizeBytes: this.indexSizeBytes,
-                lines: this.indexedLines.map(line => ({
-                    uri: line.uri.toString(),
-                    lineNumber: line.lineNumber,
-                    text: line.text,
-                    label: line.label
-                }))
-            };
-            const content = Buffer.from(JSON.stringify(cache), 'utf8');
-
-            await vscode.workspace.fs.writeFile(this.getCacheUri(), content);
-        } catch (error) {
-            Logger.debug(`Error saving text index cache: ${error}`);
+        if (fs.existsSync(bundledRg)) {
+            return bundledRg;
         }
+
+        return 'rg';
     }
 
-    private async indexFile(uri: vscode.Uri, maxFileSizeBytes: number, maxIndexBytes: number): Promise<void> {
-        try {
-            if (!isWorkspaceFile(uri) || ExclusionPatterns.shouldExclude(uri)) {
-                return;
+    private buildRgArgs(query: string): string[] {
+        const args = [
+            '--json',
+            '--fixed-strings',
+            '--ignore-case',
+            '--line-number',
+            '--column',
+            '--max-count',
+            '3',
+            query,
+            '.'
+        ];
+
+        for (const pattern of ExclusionPatterns.getExclusionPatterns()) {
+            args.splice(args.length - 2, 0, '--glob', `!${pattern}`);
+        }
+
+        return args;
+    }
+
+    private processRgOutput(
+        buffer: string,
+        folder: vscode.WorkspaceFolder,
+        query: string,
+        results: TextMatchItem[],
+        limit: number
+    ): string {
+        const lines = buffer.split('\n');
+        const remainder = lines.pop() || '';
+
+        for (const line of lines) {
+            if (results.length >= limit || !line.trim()) {
+                continue;
             }
 
-            const stat = await vscode.workspace.fs.stat(uri);
+            try {
+                const event = JSON.parse(line) as RgMatch;
 
-            if (stat.size > maxFileSizeBytes) {
-                return;
-            }
-
-            const document = await vscode.workspace.openTextDocument(uri);
-            const lines = document.getText().split('\n');
-
-            for (let lineNumber = 0; lineNumber < lines.length; lineNumber++) {
-                const text = lines[lineNumber];
-                const label = text.trim();
-
-                if (!label) {
+                if (event.type !== 'match' || !event.data) {
                     continue;
                 }
 
-                const lineSizeBytes = Buffer.byteLength(text, 'utf8') + indexedLineOverheadBytes(uri);
+                const item = this.createSearchItem(folder, event.data, query);
 
-                if (this.indexSizeBytes + lineSizeBytes > maxIndexBytes) {
-                    return;
+                if (item) {
+                    results.push(item);
                 }
-
-                this.indexedLines.push({
-                    uri,
-                    lineNumber,
-                    text,
-                    label,
-                    lowerText: text.toLowerCase()
-                });
-                this.indexSizeBytes += lineSizeBytes;
+            } catch (error) {
+                Logger.debug(`Error parsing ripgrep text search output: ${error}`);
             }
-        } catch (error) {
-            Logger.debug(`Error indexing text file ${uri.toString()}: ${error}`);
         }
+
+        return remainder;
     }
 
-    private getStorageUri(): vscode.Uri {
-        return this.context.storageUri || vscode.Uri.joinPath(this.context.globalStorageUri, 'workspace-cache');
-    }
+    private createSearchItem(folder: vscode.WorkspaceFolder, data: NonNullable<RgMatch['data']>, query: string): TextMatchItem | undefined {
+        const relativePath = data.path?.text;
+        const lineText = data.lines?.text;
+        const lineNumber = data.line_number;
+        const submatch = data.submatches?.[0];
 
-    private getCacheUri(): vscode.Uri {
-        return vscode.Uri.joinPath(this.getStorageUri(), 'text-index.json');
-    }
+        if (!relativePath || !lineText || !lineNumber || !submatch) {
+            return undefined;
+        }
 
-    private createSearchItem(indexedLine: IndexedTextLine, matchIndex: number, query: string): TextMatchItem {
-        const startPos = new vscode.Position(indexedLine.lineNumber, matchIndex);
-        const endPos = new vscode.Position(indexedLine.lineNumber, matchIndex + query.trim().length);
-        const range = new vscode.Range(startPos, endPos);
+        const uri = vscode.Uri.joinPath(folder.uri, relativePath);
+
+        if (!isWorkspaceFile(uri) || ExclusionPatterns.shouldExclude(uri)) {
+            return undefined;
+        }
+
+        const start = new vscode.Position(lineNumber - 1, submatch.start);
+        const end = new vscode.Position(lineNumber - 1, submatch.end);
+        const range = new vscode.Range(start, end);
 
         return {
-            id: `text-match:${indexedLine.uri.toString()}:${range.start.line}:${range.start.character}`,
+            id: `text-match:${uri.toString()}:${range.start.line}:${range.start.character}`,
             type: SearchItemType.TextMatch,
-            label: indexedLine.label,
-            description: vscode.workspace.asRelativePath(indexedLine.uri),
-            detail: `Line ${range.start.line + 1}`,
-            uri: indexedLine.uri,
+            label: lineText.trim(),
+            description: vscode.workspace.asRelativePath(uri),
+            detail: `Line ${lineNumber}`,
+            uri,
             range,
-            lineText: indexedLine.text,
-            matchText: indexedLine.text.substring(matchIndex, matchIndex + query.trim().length),
+            lineText,
+            matchText: submatch.match?.text || query,
             score: 1.0,
             action: async () => {
                 try {
-                    const document = await vscode.workspace.openTextDocument(indexedLine.uri);
+                    const document = await vscode.workspace.openTextDocument(uri);
                     const editor = await vscode.window.showTextDocument(document);
 
                     editor.revealRange(range, vscode.TextEditorRevealType.InCenter);
@@ -284,21 +243,4 @@ export class TextSearchProvider implements SearchProvider {
             priority: 30
         };
     }
-}
-
-interface CachedTextIndex {
-    version: number;
-    indexSizeBytes: number;
-    lines: CachedTextLine[];
-}
-
-interface CachedTextLine {
-    uri: string;
-    lineNumber: number;
-    text: string;
-    label: string;
-}
-
-function indexedLineOverheadBytes(uri: vscode.Uri): number {
-    return Buffer.byteLength(uri.toString(), 'utf8') + 64;
 }

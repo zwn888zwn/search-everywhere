@@ -20,6 +20,8 @@ export enum FilterCategory {
  */
 export class SearchUI {
     private static readonly LAST_QUERY_KEY = 'searchEverywhere.lastQuery';
+    private static readonly TEXT_FALLBACK_MIN_QUERY_LENGTH = 3;
+    private static readonly TEXT_FALLBACK_RESULT_THRESHOLD = 12;
 
     private quickPick: vscode.QuickPick<SearchQuickPickItem>;
     private searchDebounce: NodeJS.Timeout | undefined;
@@ -274,7 +276,10 @@ export class SearchUI {
         // Show the quick pick
         this.quickPick.show();
 
-        this.performSearch(initialQuery);
+        setTimeout(() => {
+            this.searchService.startIndexing();
+            this.performSearch(initialQuery);
+        }, 0);
     }
 
     /**
@@ -320,16 +325,71 @@ export class SearchUI {
             }
 
             if (searchFilter === FilterCategory.All) {
-                const primaryResults = await this.searchService.search(query, { includeText: false });
+                const isFunctionQuery = this.isFunctionNameQuery(query);
+                const primaryResultsPromise = this.searchService.search(query, {
+                    includeText: false,
+                    includeFunctions: false
+                });
+                const textResultsPromise = this.searchService.searchText(query);
+                const functionResultsPromise = isFunctionQuery
+                    ? this.searchService.searchFunctionNames(query)
+                    : Promise.resolve([]);
+
+                let quickResults: SearchItem[] = [];
+                let textResults: SearchItem[] = [];
+
+                if (isFunctionQuery) {
+                    const functionResults = await functionResultsPromise;
+
+                    if (!this.isCurrentSearch(query, generation, FilterCategory.All)) {
+                        return;
+                    }
+
+                    quickResults = functionResults;
+
+                    if (quickResults.length > 0) {
+                        this.updateSearchItems(quickResults);
+                        this.quickPick.busy = false;
+                    }
+                } else {
+                    textResults = await textResultsPromise;
+
+                    if (!this.isCurrentSearch(query, generation, FilterCategory.All)) {
+                        return;
+                    }
+
+                    quickResults = textResults;
+
+                    if (quickResults.length > 0) {
+                        this.updateSearchItems(quickResults);
+                        this.quickPick.busy = false;
+                    }
+                }
+
+                const primaryResults = await primaryResultsPromise;
 
                 if (!this.isCurrentSearch(query, generation, FilterCategory.All)) {
                     return;
                 }
 
-                this.updateSearchItems(primaryResults);
-                this.quickPick.busy = false;
+                quickResults = this.mergeSearchResults(primaryResults, quickResults);
 
-                void this.appendTextResults(query, primaryResults, generation);
+                if (quickResults.length > 0) {
+                    this.updateSearchItems(quickResults);
+                    this.quickPick.busy = false;
+                }
+
+                if (isFunctionQuery) {
+                    textResults = await textResultsPromise;
+
+                    if (!this.isCurrentSearch(query, generation, FilterCategory.All)) {
+                        return;
+                    }
+
+                    if (textResults.length > 0) {
+                        this.updateSearchItems(this.mergeSearchResults(quickResults, textResults));
+                    }
+                }
 
                 return;
             }
@@ -353,6 +413,15 @@ export class SearchUI {
         } finally {
             this.quickPick.busy = false;
         }
+    }
+
+    private shouldAppendTextFallback(query: string, primaryResults: SearchItem[]): boolean {
+        if (primaryResults.length === 0) {
+            return true;
+        }
+
+        return query.trim().length >= SearchUI.TEXT_FALLBACK_MIN_QUERY_LENGTH &&
+            primaryResults.length < SearchUI.TEXT_FALLBACK_RESULT_THRESHOLD;
     }
 
     private async appendTextResults(query: string, primaryResults: SearchItem[], generation: number): Promise<void> {
@@ -389,6 +458,10 @@ export class SearchUI {
         }
 
         return merged;
+    }
+
+    private isFunctionNameQuery(query: string): boolean {
+        return /^[A-Za-z0-9_$]+$/.test(query.trim());
     }
 
     private updateSearchItems(results: SearchItem[]): void {
@@ -479,6 +552,10 @@ export class SearchUI {
 
         // Dispose of any preview disposables
         this.disposePreviewDisposables();
+
+        // Refresh the persisted index after the interactive search is gone, so
+        // large workspaces do not compete with the current typing/search path.
+        this.searchService.scheduleBackgroundRefresh(1500);
     }
 
     /**

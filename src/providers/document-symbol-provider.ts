@@ -102,9 +102,8 @@ export class DocumentSymbolProvider implements SearchProvider {
      */
     private isSupportedLanguage(filePath: string): boolean {
         const supportedExtensions = [
-            '.js', '.jsx', '.ts', '.tsx', '.py', '.java', '.c', '.cpp', '.cs',
-            '.go', '.rb', '.php', '.rust', '.swift', '.html', '.css', '.scss',
-            '.sass', '.less', '.json', '.yaml', '.yml', '.toml', '.xml'
+            '.go', '.py', '.java', '.c', '.h', '.cpp', '.hpp',
+            '.js', '.jsx', '.ts', '.tsx', '.vue'
         ];
 
         return supportedExtensions.some(ext => filePath.toLowerCase().endsWith(ext));
@@ -143,7 +142,7 @@ export class DocumentSymbolProvider implements SearchProvider {
 
             // Find source code files to scan for symbols
             // Focus on common source code extensions to avoid scanning too many files
-            const sourceFilePattern = '**/*.{js,jsx,ts,tsx,py,java,c,cpp,cs,go,rb,php,rust,swift}';
+            const sourceFilePattern = '**/*.{go,py,java,c,h,cpp,hpp,js,jsx,ts,tsx,vue}';
 
             // Get exclusion pattern from utility
             const excludePattern = ExclusionPatterns.getExclusionGlob();

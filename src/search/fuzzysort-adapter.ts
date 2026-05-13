@@ -1,9 +1,12 @@
 import { FuzzySearcher, SearchItem } from '../core/types';
-// @ts-ignore - Import with require to avoid TypeScript issues
-const fuzzysort = require('fuzzysort');
 
 /**
- * Adapter for the fuzzysort library
+ * Fast name/path matcher used for Search Everywhere.
+ *
+ * The old implementation allocated a new fuzzysort target object for every item
+ * on every keystroke. In large workspaces that makes input feel blocked. This
+ * matcher keeps the hot path allocation-light and scores only label + relative
+ * path, similar to IDE "go to name" search.
  */
 export class FuzzysortAdapter implements FuzzySearcher {
     public readonly name = 'fuzzysort';
@@ -12,43 +15,121 @@ export class FuzzysortAdapter implements FuzzySearcher {
      * Search items using fuzzysort
      */
     public async search(items: SearchItem[], query: string, limit = 100): Promise<SearchItem[]> {
-        if (!query.trim()) {
+        const normalizedQuery = normalize(query);
+
+        if (!normalizedQuery) {
             return items.slice(0, limit);
         }
 
-        const startTime = performance.now();
+        const matches: Array<{ item: SearchItem; score: number }> = [];
+        const trimAt = Math.max(limit * 4, limit + 50);
 
-        // We'll create a simpler version that works with any objects
-        const targets = items.map(item => {
-            // Create concatenated search text
-            const searchText = `${item.label} ${item.description || ''} ${item.detail || ''}`;
+        for (const item of items) {
+            const score = scoreItem(item, normalizedQuery);
 
-            return {
-                searchText,
-                originalItem: item
-            };
-        });
+            if (score <= 0) {
+                continue;
+            }
 
-        // @ts-ignore - We're using the library in a way that TypeScript can't validate
-        const results = fuzzysort.go(query, targets, {
-            key: 'searchText',
-            limit: limit * 2
-        });
+            item.score = score / 10000;
+            matches.push({ item, score });
 
-        // Map results back to items
-        const foundItems = results.map((result: any) => {
-            const item = result.obj.originalItem;
-            const normalizedScore = Math.max(0, 1000 + result.score) / 1000;
+            if (matches.length > trimAt) {
+                matches.sort((a, b) => b.score - a.score || a.item.label.localeCompare(b.item.label));
+                matches.length = limit;
+            }
+        }
 
-            item.score = normalizedScore;
+        matches.sort((a, b) => b.score - a.score || a.item.label.localeCompare(b.item.label));
 
-            return item;
-        });
-
-        const endTime = performance.now();
-
-        console.log(`Fuzzysort search took ${endTime - startTime}ms for ${items.length} items`);
-
-        return foundItems.slice(0, limit);
+        return matches.slice(0, limit).map(match => match.item);
     }
+}
+
+function scoreItem(item: SearchItem, query: string): number {
+    const label = normalize(item.label);
+    const pathText = normalize(`${item.description || ''}`);
+    let score = scoreText(label, query, 10000);
+
+    if (pathText) {
+        score = Math.max(score, scoreText(pathText, query, 6500));
+    }
+
+    return score + (item.priority || 0);
+}
+
+function scoreText(text: string, query: string, base: number): number {
+    if (!text) {
+        return 0;
+    }
+
+    if (text === query) {
+        return base;
+    }
+
+    if (text.startsWith(query)) {
+        return base - 500;
+    }
+
+    const index = text.indexOf(query);
+
+    if (index >= 0) {
+        return base - 1500 - Math.min(index, 500);
+    }
+
+    return scoreSubsequence(text, query, base - 3500);
+}
+
+function scoreSubsequence(text: string, query: string, base: number): number {
+    let firstMatch = -1;
+    let lastMatch = -1;
+    let score = base;
+
+    for (const char of query) {
+        const match = text.indexOf(char, lastMatch + 1);
+
+        if (match === -1) {
+            return 0;
+        }
+
+        if (firstMatch === -1) {
+            firstMatch = match;
+        }
+
+        if (lastMatch >= 0) {
+            score -= Math.min(match - lastMatch - 1, 20) * 20;
+        }
+
+        if (isBoundary(text, match)) {
+            score += 250;
+        }
+
+        lastMatch = match;
+    }
+
+    const span = lastMatch - firstMatch + 1;
+
+    if (span > query.length * 4 + 16) {
+        return 0;
+    }
+
+    return Math.max(1, score - Math.min(text.length, 300));
+}
+
+function isBoundary(text: string, index: number): boolean {
+    if (index === 0) {
+        return true;
+    }
+
+    const previous = text[index - 1];
+
+    return previous === '/' ||
+        previous === '_' ||
+        previous === '-' ||
+        previous === '.' ||
+        previous === ' ';
+}
+
+function normalize(value: string): string {
+    return value.trim().toLowerCase();
 }

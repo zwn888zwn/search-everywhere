@@ -1,4 +1,8 @@
 import * as vscode from 'vscode';
+import { spawn } from 'child_process';
+import * as fs from 'fs';
+import * as path from 'path';
+import * as readline from 'readline';
 import { CommandSearchItem, FileSearchItem, FuzzySearcher, SearchEverywhereConfig, SearchItem, SearchItemType, SearchProvider, SymbolKindGroup, SymbolSearchItem, TextMatchItem } from './types';
 import { FileSearchProvider } from '../providers/file-provider';
 import { CommandSearchProvider } from '../providers/command-provider';
@@ -8,12 +12,30 @@ import { getConfiguration } from '../utils/config';
 import { SearchFactory } from '../search/search-factory';
 import { Debouncer } from '../utils/debouncer';
 import { isWorkspaceFile } from '../utils/workspace';
+import { ExclusionPatterns } from '../utils/exclusions';
+
+interface RgMatch {
+    type: string;
+    data?: {
+        path?: { text?: string };
+        lines?: { text?: string };
+        line_number?: number;
+    };
+}
+
+interface ParsedFunction {
+    name: string;
+    offset: number;
+    container?: string;
+    isMethod: boolean;
+}
 
 /**
  * Main service for coordinating search functionality
  */
 export class SearchService {
-    private static readonly CACHE_VERSION = 3;
+    private static readonly CACHE_VERSION = 9;
+    private static readonly MAX_CACHE_LOAD_BYTES = 64 * 1024 * 1024;
 
     private providers: Map<string, SearchProvider> = new Map();
     private searcher: FuzzySearcher;
@@ -23,6 +45,13 @@ export class SearchService {
     private activityDebouncer: Debouncer;
     private indexUpdateDebouncer: Debouncer;
     private cacheLoadPromise: Promise<void>;
+    private indexStartupStarted = false;
+    private indexRefreshPromise: Promise<void> | undefined;
+    private backgroundRefreshTimer: NodeJS.Timeout | undefined;
+    private backgroundRefreshRequestPromise: Promise<void> | undefined;
+    private resolveBackgroundRefreshRequest: (() => void) | undefined;
+    private backgroundRefreshRequested = false;
+    private hasBuiltIndex = false;
 
     /**
      * Initialize the search service
@@ -41,14 +70,7 @@ export class SearchService {
         // Register search providers
         this.registerProviders();
 
-        this.cacheLoadPromise = Promise.resolve(vscode.window.withProgress(
-            {
-                location: vscode.ProgressLocation.Notification,
-                title: 'Loading Search Everywhere index...',
-                cancellable: false
-            },
-            async (progress) => this.loadIndexCache(progress)
-        ));
+        this.cacheLoadPromise = Promise.resolve();
 
         // Listen for configuration changes
         vscode.workspace.onDidChangeConfiguration(e => {
@@ -73,8 +95,86 @@ export class SearchService {
         // Watch for file changes to update indexes
         this.watchFileChanges();
 
-        // Initial index
-        void this.cacheLoadPromise.finally(() => this.refreshIndex());
+        // Index loading is started lazily after the search UI is visible.
+    }
+
+    public startIndexing(): void {
+        if (this.indexStartupStarted) {
+            return;
+        }
+
+        this.indexStartupStarted = true;
+        let resolveCacheLoad!: () => void;
+
+        this.cacheLoadPromise = new Promise(resolve => {
+            resolveCacheLoad = resolve;
+        });
+
+        void vscode.window.withProgress(
+            {
+                location: vscode.ProgressLocation.Notification,
+                title: 'Loading Search Everywhere index...',
+                cancellable: false
+            },
+            async (progress) => {
+                try {
+                    await this.loadIndexCache(progress);
+
+                    if (this.allItems.length === 0) {
+                        progress.report({ message: 'Building initial file index...', increment: 5 });
+                        await this.loadInitialFileIndex();
+                    }
+                } finally {
+                    resolveCacheLoad();
+                }
+
+                progress.report({ message: `Cache usable (${this.allItems.length} items). Waiting to refresh full index...`, increment: 0 });
+                await this.waitForBackgroundRefreshRequest();
+                progress.report({ message: 'Refreshing full workspace index...', increment: 0 });
+                await this.refreshIndex(false, false, progress);
+                progress.report({ message: `Full index ready (${this.allItems.length} items)`, increment: 100 });
+            }
+        ).then(undefined, error => {
+            resolveCacheLoad();
+            console.error('Error starting Search Everywhere index:', error);
+        });
+
+    }
+
+    public scheduleBackgroundRefresh(delayMs: number = 1000): void {
+        this.startIndexing();
+
+        if (this.backgroundRefreshTimer) {
+            clearTimeout(this.backgroundRefreshTimer);
+        }
+
+        this.backgroundRefreshTimer = setTimeout(() => {
+            this.backgroundRefreshTimer = undefined;
+            this.requestBackgroundRefresh();
+        }, delayMs);
+    }
+
+    private waitForBackgroundRefreshRequest(): Promise<void> {
+        if (this.backgroundRefreshRequested) {
+            return Promise.resolve();
+        }
+
+        if (!this.backgroundRefreshRequestPromise) {
+            this.backgroundRefreshRequestPromise = new Promise(resolve => {
+                this.resolveBackgroundRefreshRequest = resolve;
+            });
+        }
+
+        return this.backgroundRefreshRequestPromise;
+    }
+
+    private requestBackgroundRefresh(): void {
+        if (this.backgroundRefreshRequested) {
+            return;
+        }
+
+        this.backgroundRefreshRequested = true;
+        this.resolveBackgroundRefreshRequest?.();
     }
 
     /**
@@ -87,11 +187,9 @@ export class SearchService {
             this.scheduleIndexUpdate();
         });
 
-        // Watch for file deletions, renames, etc.
-        vscode.workspace.onDidCloseTextDocument(() => {
-            console.log('File closed, scheduling index update...');
-            this.scheduleIndexUpdate();
-        });
+        // Do not update on document close. Previewing search results can close
+        // documents frequently, and treating that as an index mutation makes
+        // results appear/disappear after the visible indexing progress ended.
     }
 
     /**
@@ -110,11 +208,20 @@ export class SearchService {
      * This is faster than a full refresh because it doesn't force providers to re-index
      */
     private async updateIndexFromProviders(): Promise<void> {
-        // Temporary map to deduplicate items
+        // Keep already available results usable while slower providers refresh.
         const deduplicationMap = new Map<string, SearchItem>();
 
-        // Collect latest items from all providers
-        for (const [name, provider] of this.providers.entries()) {
+        for (const item of this.allItems) {
+            deduplicationMap.set(this.getDeduplicationKey(item), item);
+        }
+
+        // Collect only providers that are cheap and deterministic after edits.
+        // Symbols are found on demand; pulling docSymbols here can silently run
+        // a workspace scan after the progress notification has already closed.
+        const providerEntries = [...this.providers.entries()]
+            .filter(([name]) => name === 'files' || name === 'commands');
+
+        for (const [name, provider] of providerEntries) {
             try {
                 const items = await provider.getItems();
 
@@ -217,7 +324,7 @@ export class SearchService {
 
         // Add text search provider
         if (this.config.indexing.includeText) {
-            this.providers.set('text', new TextSearchProvider(this.context));
+            this.providers.set('text', new TextSearchProvider());
         }
     }
 
@@ -225,19 +332,56 @@ export class SearchService {
      * Refresh all search indexes
      * @param force If true, forces a complete reindex even if the provider is already refreshing
      */
-    public async refreshIndex(force: boolean = false, recreateProviders: boolean = force): Promise<void> {
+    public async refreshIndex(
+        force: boolean = false,
+        recreateProviders: boolean = force,
+        progress?: vscode.Progress<{ message?: string; increment?: number }>
+    ): Promise<void> {
+        if (this.indexRefreshPromise && !force && !recreateProviders) {
+            return this.indexRefreshPromise;
+        }
+
+        this.indexRefreshPromise = this.refreshIndexInternal(force, recreateProviders, progress);
+
+        try {
+            await this.indexRefreshPromise;
+        } finally {
+            this.indexRefreshPromise = undefined;
+        }
+    }
+
+    private async refreshIndexInternal(
+        force: boolean = false,
+        recreateProviders: boolean = force,
+        progress?: vscode.Progress<{ message?: string; increment?: number }>
+    ): Promise<void> {
         // Refresh providers based on configuration only when the provider set may have changed.
         if (recreateProviders) {
             this.providers.clear();
             this.registerProviders();
         }
 
-        // Temporary map to deduplicate items
+        // Keep cached/previous results usable while slower providers refresh in the background.
         const deduplicationMap = new Map<string, SearchItem>();
 
+        if (!force && !recreateProviders) {
+            for (const item of this.allItems) {
+                deduplicationMap.set(this.getDeduplicationKey(item), item);
+            }
+        }
+
         // Collect items from all providers
-        for (const [name, provider] of this.providers.entries()) {
+        const providerEntries = [...this.providers.entries()]
+            .filter(([name]) => force || name !== 'docSymbols');
+
+        providerEntries.sort(([leftName], [rightName]) => this.getProviderRefreshOrder(leftName) - this.getProviderRefreshOrder(rightName));
+
+        const providerIncrement = providerEntries.length > 0 ? Math.floor(55 / providerEntries.length) : 0;
+
+        for (const [name, provider] of providerEntries) {
             try {
+                progress?.report({ message: `Indexing ${name}...`, increment: providerIncrement });
+
                 // If force is true, we'll manually call refresh on each provider
                 if (force) {
                     console.log(`Forcing refresh of ${name} provider...`);
@@ -249,6 +393,14 @@ export class SearchService {
                 const items = await provider.getItems();
 
                 console.log(`Got ${items.length} items from ${name} provider`);
+
+                if (!force && !recreateProviders) {
+                    for (const [key, item] of [...deduplicationMap.entries()]) {
+                        if (this.getProviderNameForItem(item) === name) {
+                            deduplicationMap.delete(key);
+                        }
+                    }
+                }
 
                 // Deduplicate items as they come in
                 for (const item of items) {
@@ -262,6 +414,7 @@ export class SearchService {
                         deduplicationMap.set(dedupeKey, item);
                     }
                 }
+
             } catch (error) {
                 console.error(`Error getting items from ${name} provider:`, error);
             }
@@ -269,65 +422,426 @@ export class SearchService {
 
         // Convert the deduplication map to the array
         this.allItems = Array.from(deduplicationMap.values());
-        void this.saveIndexCache();
+        this.hasBuiltIndex = true;
+        progress?.report({ message: `Writing index cache (${this.allItems.length} items)...`, increment: 10 });
+        await this.saveIndexCache();
 
         console.log(`Indexing completed: ${this.allItems.length} items (after deduplication)`);
+    }
+
+    private getProviderRefreshOrder(name: string): number {
+        switch (name) {
+            case 'files':
+                return 0;
+
+            case 'commands':
+                return 1;
+
+            case 'text':
+                return 2;
+
+            case 'docSymbols':
+                return 3;
+
+            default:
+                return 10;
+        }
+    }
+
+    private getProviderNameForItem(item: SearchItem): string | undefined {
+        switch (item.type) {
+            case SearchItemType.File:
+                return 'files';
+
+            case SearchItemType.Symbol:
+
+            case SearchItemType.Class:
+                return 'docSymbols';
+
+            case SearchItemType.Command:
+                return 'commands';
+
+            case SearchItemType.TextMatch:
+                return 'text';
+
+            default:
+                return undefined;
+        }
     }
 
     /**
      * Generate a key for deduplicating search items
      */
-    private async loadIndexCache(progress?: vscode.Progress<{ message?: string; increment?: number }>): Promise<void> {
-        progress?.report({ message: 'Reading cached file and symbol index...', increment: 10 });
+    private async loadInitialFileIndex(): Promise<void> {
+        const fileProvider = this.providers.get('files');
+
+        if (!(fileProvider instanceof FileSearchProvider)) {
+            return;
+        }
 
         try {
-            const cacheUri = this.getCacheUri('search-index.json');
-            const raw = await vscode.workspace.fs.readFile(cacheUri);
+            const items = await fileProvider.warmUp(2000);
+            const deduplicationMap = new Map<string, SearchItem>();
 
-            progress?.report({ message: 'Restoring cached file and symbol index...', increment: 45 });
-
-            const cache = JSON.parse(Buffer.from(raw).toString('utf8')) as CachedSearchIndex;
-
-            if (cache.version === SearchService.CACHE_VERSION && Array.isArray(cache.items)) {
-                this.allItems = cache.items
-                    .map(item => this.deserializeCachedItem(item))
-                    .filter((item): item is SearchItem => item !== undefined);
-
-                if (Array.isArray(cache.recentFiles)) {
-                    this.recentlyModifiedFiles = new Map(cache.recentFiles);
-                }
+            for (const item of this.allItems) {
+                deduplicationMap.set(this.getDeduplicationKey(item), item);
             }
+
+            for (const item of items) {
+                if (!this.isWorkspaceScopedItem(item)) {
+                    continue;
+                }
+
+                deduplicationMap.set(this.getDeduplicationKey(item), item);
+            }
+
+            this.allItems = Array.from(deduplicationMap.values());
+        } catch (error) {
+            console.error('Error building initial file index:', error);
+        }
+    }
+
+    private async findFunctionCandidatesInFolder(folder: vscode.WorkspaceFolder, query: string, limit: number): Promise<SymbolSearchItem[]> {
+        return new Promise(resolve => {
+            const results: SymbolSearchItem[] = [];
+            const args = this.buildFunctionQueryRgArgs(query);
+            const child = spawn(this.getRgCommand(), args, {
+                cwd: folder.uri.fsPath,
+                windowsHide: true
+            });
+            let buffer = '';
+
+            child.stdout.setEncoding('utf8');
+            child.stdout.on('data', chunk => {
+                buffer += chunk;
+                buffer = this.processFunctionRgOutput(buffer, folder, results, limit);
+
+                if (results.length >= limit) {
+                    child.kill();
+                }
+            });
+
+            child.stderr.setEncoding('utf8');
+            child.stderr.on('data', chunk => {
+                console.log(`ripgrep function query stderr: ${chunk}`);
+            });
+
+            child.on('error', error => {
+                console.log(`ripgrep function query failed: ${error}`);
+                resolve(results);
+            });
+
+            child.on('close', () => {
+                if (buffer.trim()) {
+                    this.processFunctionRgOutput(`${buffer}\n`, folder, results, limit);
+                }
+
+                resolve(results);
+            });
+        });
+    }
+
+    private buildFunctionQueryRgArgs(query: string): string[] {
+        const args = [
+            '--json',
+            '--ignore-case',
+            '--line-number',
+            '--column',
+            '.'
+        ];
+
+        for (const pattern of this.buildFunctionDeclarationRegexes(query)) {
+            args.splice(args.length - 1, 0, '-e', pattern);
+        }
+
+        for (const pattern of this.getFunctionFileGlobs()) {
+            args.splice(args.length - 1, 0, '--glob', pattern);
+        }
+
+        for (const pattern of ExclusionPatterns.getExclusionPatterns()) {
+            args.splice(args.length - 1, 0, '--glob', `!${pattern}`);
+        }
+
+        return args;
+    }
+
+    private buildFunctionDeclarationRegexes(query: string): string[] {
+        const namePattern = this.buildIdentifierSubsequenceRegex(query);
+
+        return [
+            `^\\s*func\\s+(?:\\([^)]*\\)\\s*)?${namePattern}\\s*(?:\\[[^\\]]+\\]\\s*)?\\(`,
+            `^\\s*(?:async\\s+)?def\\s+${namePattern}\\s*\\(`,
+            `^\\s*(?:export\\s+)?(?:async\\s+)?function\\s+${namePattern}\\s*\\(`,
+            `^\\s*(?:export\\s+)?(?:const|let|var)\\s+${namePattern}\\s*=`,
+            `^\\s*(?:async\\s+)?${namePattern}\\s*\\([^)]*\\)\\s*\\{`,
+            `^\\s*(?:(?:public|private|protected|static|final|native|synchronized|abstract|inline|extern|virtual|constexpr|const|unsigned|signed|long|short|struct|class|[\\w:<>&*\\[\\]])+\\s+)+${namePattern}\\s*\\(`
+        ];
+    }
+
+    private buildIdentifierSubsequenceRegex(query: string): string {
+        const chars = normalizeSearchText(query)
+            .split('')
+            .map(char => char.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+            .join('[\\w$]*?');
+
+        return `(?:[A-Za-z_$][\\w$]*?)?${chars}[\\w$]*?`;
+    }
+
+    private getFunctionFileGlobs(): string[] {
+        return [
+            '*.go',
+            '*.py',
+            '*.java',
+            '*.c',
+            '*.h',
+            '*.cpp',
+            '*.hpp',
+            '*.js',
+            '*.jsx',
+            '*.ts',
+            '*.tsx',
+            '*.vue'
+        ];
+    }
+
+    private processFunctionRgOutput(
+        buffer: string,
+        folder: vscode.WorkspaceFolder,
+        results: SymbolSearchItem[],
+        limit: number
+    ): string {
+        const lines = buffer.split('\n');
+        const remainder = lines.pop() || '';
+
+        for (const line of lines) {
+            if (results.length >= limit || !line.trim()) {
+                continue;
+            }
+
+            try {
+                const event = JSON.parse(line) as RgMatch;
+
+                if (event.type !== 'match' || !event.data) {
+                    continue;
+                }
+
+                const item = this.createFunctionSymbolItem(folder, event.data);
+
+                if (item) {
+                    results.push(item);
+                }
+            } catch (error) {
+                console.log(`Error parsing function index output: ${error}`);
+            }
+        }
+
+        return remainder;
+    }
+
+    private createFunctionSymbolItem(folder: vscode.WorkspaceFolder, data: NonNullable<RgMatch['data']>): SymbolSearchItem | undefined {
+        const relativePath = data.path?.text;
+        const lineText = data.lines?.text;
+        const lineNumber = data.line_number;
+
+        if (!relativePath || !lineText || !lineNumber) {
+            return undefined;
+        }
+
+        const uri = vscode.Uri.joinPath(folder.uri, relativePath);
+
+        if (!isWorkspaceFile(uri) || ExclusionPatterns.shouldExclude(uri)) {
+            return undefined;
+        }
+
+        const parsedFunction = this.parseFunctionLine(uri.fsPath, lineText);
+
+        if (!parsedFunction) {
+            return undefined;
+        }
+
+        const kind = parsedFunction.isMethod ? vscode.SymbolKind.Method : vscode.SymbolKind.Function;
+        const range = new vscode.Range(
+            new vscode.Position(lineNumber - 1, parsedFunction.offset),
+            new vscode.Position(lineNumber - 1, parsedFunction.offset + parsedFunction.name.length)
+        );
+
+        return {
+            id: `symbol:${parsedFunction.name}:${uri.toString()}:${range.start.line}:${range.start.character}`,
+            label: parsedFunction.name,
+            description: parsedFunction.isMethod && parsedFunction.container ? `Method - ${parsedFunction.container}` : 'Function',
+            detail: uri.fsPath,
+            type: SearchItemType.Symbol,
+            uri,
+            range,
+            symbolKind: kind,
+            symbolGroup: SymbolKindGroup.Function,
+            priority: 90,
+            iconPath: new vscode.ThemeIcon('symbol-method'),
+            action: async () => {
+                const document = await vscode.workspace.openTextDocument(uri);
+                const editor = await vscode.window.showTextDocument(document);
+
+                editor.selection = new vscode.Selection(range.start, range.start);
+                editor.revealRange(range, vscode.TextEditorRevealType.InCenter);
+            }
+        };
+    }
+
+    private parseFunctionLine(filePath: string, lineText: string): ParsedFunction | undefined {
+        const lowerPath = filePath.toLowerCase();
+
+        if (lowerPath.endsWith('.go')) {
+            return this.parseFunctionWithRegex(lineText, /^(\s*)func\s+(?:\(([^)]*)\)\s*)?([A-Za-z_]\w*)\s*(?:\[[^\]]+\]\s*)?\(/, 3, 2);
+        }
+
+        if (lowerPath.endsWith('.py')) {
+            return this.parseFunctionWithRegex(lineText, /^(\s*)(?:async\s+)?def\s+([A-Za-z_]\w*)\s*\(/, 2);
+        }
+
+        if (/\.(?:js|jsx|ts|tsx|vue)$/.test(lowerPath)) {
+            return this.parseJsLikeFunctionLine(lineText);
+        }
+
+        if (/\.(?:java|c|h|cpp|hpp)$/.test(lowerPath)) {
+            return this.parseCStyleFunctionLine(lineText);
+        }
+
+        return undefined;
+    }
+
+    private parseJsLikeFunctionLine(lineText: string): ParsedFunction | undefined {
+        return this.parseFunctionWithRegex(lineText, /^(\s*)(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(/, 2) ||
+            this.parseFunctionWithRegex(lineText, /^(\s*)(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=/, 2) ||
+            this.parseFunctionWithRegex(lineText, /^(\s*)(?:async\s+)?([A-Za-z_$][\w$]*)\s*\([^)]*\)\s*\{/, 2, undefined, true);
+    }
+
+    private parseCStyleFunctionLine(lineText: string): ParsedFunction | undefined {
+        const trimmed = lineText.trim();
+
+        if (!trimmed || trimmed.startsWith('//') || trimmed.startsWith('*') || trimmed.endsWith(';')) {
+            return undefined;
+        }
+
+        return this.parseFunctionWithRegex(
+            lineText,
+            /^(\s*)(?:(?:public|private|protected|static|final|native|synchronized|abstract|inline|extern|virtual|constexpr|const|unsigned|signed|long|short|struct|class|[\w:<>\*\&\[\]])+\s+)+([A-Za-z_$][\w$]*)\s*\(/,
+            2
+        );
+    }
+
+    private parseFunctionWithRegex(
+        lineText: string,
+        regex: RegExp,
+        nameGroup: number,
+        containerGroup?: number,
+        forceMethod: boolean = false
+    ): ParsedFunction | undefined {
+        const match = regex.exec(lineText);
+
+        if (!match) {
+            return undefined;
+        }
+
+        const name = match[nameGroup];
+        const container = containerGroup !== undefined ? match[containerGroup]?.trim() : undefined;
+        const offset = lineText.indexOf(name, match[1]?.length || 0);
+
+        if (!name || offset < 0) {
+            return undefined;
+        }
+
+        return {
+            name,
+            offset,
+            container,
+            isMethod: forceMethod || Boolean(container)
+        };
+    }
+
+    private getRgCommand(): string {
+        const bundledRg = path.join(vscode.env.appRoot, 'node_modules', '@vscode', 'ripgrep', 'bin', process.platform === 'win32' ? 'rg.exe' : 'rg');
+
+        if (fs.existsSync(bundledRg)) {
+            return bundledRg;
+        }
+
+        return 'rg';
+    }
+
+    private async loadIndexCache(progress?: vscode.Progress<{ message?: string; increment?: number }>): Promise<void> {
+        progress?.report({ message: 'Reading cached file/action index...', increment: 10 });
+
+        try {
+            const cacheUri = this.getCacheUri('search-index.jsonl');
+            const stat = await vscode.workspace.fs.stat(cacheUri);
+
+            if (stat.size > SearchService.MAX_CACHE_LOAD_BYTES) {
+                console.log(`Skipping oversized search index cache: ${stat.size} bytes`);
+                progress?.report({ message: 'Skipping oversized cached index', increment: 80 });
+
+                return;
+            }
+
+            progress?.report({ message: 'Streaming cached file/action index...', increment: 45 });
+            await this.loadIndexCacheJsonl(cacheUri);
 
             console.log(`Loaded ${this.allItems.length} cached search items`);
             progress?.report({ message: `Loaded ${this.allItems.length} cached items`, increment: 35 });
         } catch (error) {
             console.log(`No search index cache loaded: ${error}`);
-            progress?.report({ message: 'No cached file and symbol index found', increment: 80 });
+            progress?.report({ message: 'No cached file/action index found', increment: 80 });
         }
 
-        const textProvider = this.providers.get('text');
-
-        if (textProvider instanceof TextSearchProvider) {
-            this.loadTextCacheInBackground(textProvider);
-        }
     }
 
-    private loadTextCacheInBackground(textProvider: TextSearchProvider): void {
-        void vscode.window.withProgress(
-            {
-                location: vscode.ProgressLocation.Notification,
-                title: 'Loading Search Everywhere text cache...',
-                cancellable: false
-            },
-            async (progress) => {
-                progress.report({ message: 'Reading cached text index...', increment: 10 });
-                const lineCount = await textProvider.loadCache((message, increment) => {
-                    progress.report({ message, increment });
-                });
+    private async loadIndexCacheJsonl(cacheUri: vscode.Uri): Promise<void> {
+        const items: SearchItem[] = [];
+        let isHeader = true;
+        let isSupportedVersion = false;
+        const stream = fs.createReadStream(cacheUri.fsPath, { encoding: 'utf8' });
+        const lines = readline.createInterface({
+            input: stream,
+            crlfDelay: Infinity
+        });
 
-                progress.report({ message: `Loaded ${lineCount} cached text lines`, increment: 100 });
+        for await (const line of lines) {
+            if (!line.trim()) {
+                continue;
             }
-        );
+
+            if (isHeader) {
+                isHeader = false;
+                const header = JSON.parse(line) as CachedSearchIndexHeader;
+
+                isSupportedVersion = header.version === SearchService.CACHE_VERSION;
+
+                if (!isSupportedVersion) {
+                    lines.close();
+                    stream.destroy();
+
+                    break;
+                }
+
+                if (Array.isArray(header.recentFiles)) {
+                    this.recentlyModifiedFiles = new Map(header.recentFiles);
+                }
+
+                continue;
+            }
+
+            if (!isSupportedVersion) {
+                continue;
+            }
+
+            const cachedItem = JSON.parse(line) as CachedSearchItem;
+            const item = this.deserializeCachedItem(cachedItem);
+
+            if (item && this.isWorkspaceScopedItem(item) && !this.isExcludedItem(item)) {
+                items.push(item);
+            }
+        }
+
+        this.allItems = items;
     }
 
     private async saveIndexCache(): Promise<void> {
@@ -335,20 +849,34 @@ export class SearchService {
             const storageUri = this.getStorageUri();
 
             await vscode.workspace.fs.createDirectory(storageUri);
-
-            const cache: CachedSearchIndex = {
-                version: SearchService.CACHE_VERSION,
-                items: this.allItems
-                    .map(item => this.serializeItem(item))
-                    .filter((item): item is CachedSearchItem => item !== undefined),
-                recentFiles: [...this.recentlyModifiedFiles.entries()]
-            };
-            const content = Buffer.from(JSON.stringify(cache), 'utf8');
-
-            await vscode.workspace.fs.writeFile(this.getCacheUri('search-index.json'), content);
+            await this.saveIndexCacheJsonl(this.getCacheUri('search-index.jsonl'));
         } catch (error) {
             console.error('Error saving search index cache:', error);
         }
+    }
+
+    private async saveIndexCacheJsonl(cacheUri: vscode.Uri): Promise<void> {
+        await new Promise<void>((resolve, reject) => {
+            const stream = fs.createWriteStream(cacheUri.fsPath, { encoding: 'utf8' });
+            const header: CachedSearchIndexHeader = {
+                version: SearchService.CACHE_VERSION,
+                recentFiles: [...this.recentlyModifiedFiles.entries()]
+            };
+
+            stream.on('error', reject);
+            stream.on('finish', resolve);
+            stream.write(`${JSON.stringify(header)}\n`);
+
+            for (const item of this.allItems) {
+                const cachedItem = this.serializeItem(item);
+
+                if (cachedItem) {
+                    stream.write(`${JSON.stringify(cachedItem)}\n`);
+                }
+            }
+
+            stream.end();
+        });
     }
 
     private getStorageUri(): vscode.Uri {
@@ -376,22 +904,6 @@ export class SearchService {
             };
         }
 
-        if ((item.type === SearchItemType.Symbol || item.type === SearchItemType.Class) &&
-            'uri' in item &&
-            item.uri instanceof vscode.Uri &&
-            'range' in item &&
-            item.range instanceof vscode.Range) {
-            const symbolItem = item as SymbolSearchItem;
-
-            return {
-                ...baseItem,
-                uri: symbolItem.uri.toString(),
-                range: serializeRange(symbolItem.range),
-                symbolKind: symbolItem.symbolKind,
-                symbolGroup: symbolItem.symbolGroup
-            };
-        }
-
         if (item.type === SearchItemType.Command && 'command' in item) {
             const commandItem = item as CommandSearchItem;
 
@@ -403,6 +915,14 @@ export class SearchService {
         }
 
         return undefined;
+    }
+
+    private isExcludedItem(item: SearchItem): boolean {
+        if ('uri' in item && item.uri instanceof vscode.Uri) {
+            return ExclusionPatterns.shouldExclude(item.uri);
+        }
+
+        return false;
     }
 
     private deserializeCachedItem(item: CachedSearchItem): SearchItem | undefined {
@@ -507,8 +1027,8 @@ export class SearchService {
     /**
      * Search for items matching the query
      */
-    public async search(query: string, options: { includeText?: boolean; textOnly?: boolean } = {}): Promise<SearchItem[]> {
-        await this.ensureSearchReady();
+    public async search(query: string, options: { includeText?: boolean; includeFunctions?: boolean; textOnly?: boolean } = {}): Promise<SearchItem[]> {
+        this.startIndexing();
 
         if (!query.trim()) {
             return [];
@@ -517,6 +1037,8 @@ export class SearchService {
         if (options.textOnly) {
             return this.searchText(query);
         }
+
+        await this.cacheLoadPromise;
 
         let results: SearchItem[] = [];
         const queryLimit = Math.min(this.config.performance.maxResults * 5, 1000);
@@ -527,10 +1049,16 @@ export class SearchService {
             query,
             queryLimit
         );
-        const pathResults = this.searchPathMatches(query, queryLimit);
+        const compactSubsequenceResults = this.searchCompactSubsequenceMatches(query, queryLimit);
 
-        // Combine fuzzy and explicit path results first so UI can show them immediately.
-        results = this.deduplicateResults([...fuzzyResults, ...pathResults]);
+        // The active matcher scores both label and path, so keep this to one full scan.
+        results = this.deduplicateResults([...fuzzyResults, ...compactSubsequenceResults]);
+
+        if (options.includeFunctions !== false && this.shouldSearchFunctionNamesOnDemand(query, results.length)) {
+            const functionResults = await this.searchFunctionNamesOnDemand(query, queryLimit);
+
+            results = this.deduplicateResults([...results, ...functionResults]);
+        }
 
         // Text search uses its own in-memory line index. It is intentionally last because
         // large workspaces can make full-text matching noticeably slower than item lookup.
@@ -556,8 +1084,6 @@ export class SearchService {
     }
 
     public async searchText(query: string): Promise<SearchItem[]> {
-        await this.ensureSearchReady();
-
         if (!query.trim() || !this.config.indexing.includeText) {
             return [];
         }
@@ -582,13 +1108,8 @@ export class SearchService {
         }
     }
 
-    private async ensureSearchReady(): Promise<void> {
-        await this.cacheLoadPromise;
-
-        // If nothing indexed yet, refresh
-        if (this.allItems.length === 0) {
-            await this.refreshIndex();
-        }
+    public async searchFunctionNames(query: string, limit: number = this.config.performance.maxResults): Promise<SearchItem[]> {
+        return this.searchFunctionNamesOnDemand(query, limit);
     }
 
     private convertGoFunctionTextMatch(item: TextMatchItem): SearchItem {
@@ -646,26 +1167,6 @@ export class SearchService {
         return [...nonTextResults, ...textResults];
     }
 
-    private searchPathMatches(query: string, limit: number): SearchItem[] {
-        const normalizedQuery = normalizeSearchText(query);
-
-        if (!normalizedQuery) {
-            return [];
-        }
-
-        const pathMatches = this.allItems.filter(item => {
-            if (!('uri' in item) || !(item.uri instanceof vscode.Uri)) {
-                return false;
-            }
-
-            return normalizeSearchText(vscode.workspace.asRelativePath(item.uri)).includes(normalizedQuery);
-        });
-
-        this.sortResultsByRelevance(pathMatches, query, false);
-
-        return pathMatches.slice(0, limit);
-    }
-
     private deduplicateResults(items: SearchItem[]): SearchItem[] {
         const deduplicationMap = new Map<string, SearchItem>();
 
@@ -680,15 +1181,96 @@ export class SearchService {
         return [...deduplicationMap.values()];
     }
 
+    private searchCompactSubsequenceMatches(query: string, limit: number): SearchItem[] {
+        const normalizedQuery = normalizeSearchText(query);
+
+        if (!normalizedQuery) {
+            return [];
+        }
+
+        const matches: Array<{ item: SearchItem; rank: number }> = [];
+        const trimAt = Math.max(limit * 4, limit + 50);
+
+        for (const item of this.allItems) {
+            const labelRank = getCompactSubsequenceRank(normalizeSearchText(item.label || ''), normalizedQuery, 6200);
+            const pathRank = getCompactSubsequenceRank(normalizeSearchText(this.getItemPathText(item)), normalizedQuery, 3600);
+            const rank = Math.max(labelRank, pathRank);
+
+            if (rank <= 0) {
+                continue;
+            }
+
+            item.score = Math.max(item.score || 0, rank / 10000);
+            matches.push({ item, rank: rank + (item.priority || 0) });
+
+            if (matches.length > trimAt) {
+                matches.sort((a, b) => b.rank - a.rank || a.item.label.localeCompare(b.item.label));
+                matches.length = limit;
+            }
+        }
+
+        matches.sort((a, b) => b.rank - a.rank || a.item.label.localeCompare(b.item.label));
+
+        return matches.slice(0, limit).map(match => match.item);
+    }
+
+    private shouldSearchFunctionNamesOnDemand(query: string, resultCount: number): boolean {
+        const normalizedQuery = normalizeSearchText(query);
+
+        return normalizedQuery.length >= 3 &&
+            this.isFunctionNameQuery(query) &&
+            resultCount < this.config.performance.maxResults;
+    }
+
+    private async searchFunctionNamesOnDemand(query: string, limit: number): Promise<SearchItem[]> {
+        const normalizedQuery = normalizeSearchText(query);
+
+        if (!normalizedQuery || normalizedQuery.length < 3 || !this.isFunctionNameQuery(query)) {
+            return [];
+        }
+
+        const matches: Array<{ item: SearchItem; rank: number }> = [];
+        const maxScanResults = Math.max(this.config.performance.maxResults * 20, 2000);
+
+        for (const folder of vscode.workspace.workspaceFolders || []) {
+            const items = await this.findFunctionCandidatesInFolder(folder, normalizedQuery, maxScanResults);
+
+            for (const item of items) {
+                const label = normalizeSearchText(item.label || '');
+                const pathText = normalizeSearchText(this.getItemPathText(item));
+                const exactRank = label.includes(normalizedQuery) ? 10000 : 0;
+                const rank = Math.max(
+                    exactRank,
+                    getCompactSubsequenceRank(label, normalizedQuery, 6200),
+                    getCompactSubsequenceRank(pathText, normalizedQuery, 3600)
+                );
+
+                if (rank <= 0) {
+                    continue;
+                }
+
+                item.score = Math.max(item.score || 0, rank / 10000);
+                matches.push({ item, rank: rank + (item.priority || 0) });
+            }
+        }
+
+        matches.sort((a, b) => b.rank - a.rank || a.item.label.localeCompare(b.item.label));
+
+        return matches.slice(0, limit).map(match => match.item);
+    }
+
+    private isFunctionNameQuery(query: string): boolean {
+        const trimmed = query.trim();
+
+        return /^[A-Za-z0-9_$]+$/.test(trimmed);
+    }
+
     /**
      * Get useful items for an empty query, similar to a recent files list.
      */
     public async getDefaultItems(): Promise<SearchItem[]> {
+        this.startIndexing();
         await this.cacheLoadPromise;
-
-        if (this.allItems.length === 0) {
-            await this.refreshIndex();
-        }
 
         const fileItems = this.allItems.filter((item): item is FileSearchItem =>
             item.type === SearchItemType.File &&
@@ -748,6 +1330,8 @@ export class SearchService {
             }
         }
 
+        rank += getCompactSubsequenceRank(normalizedLabel, normalizedQuery, 6200);
+
         if (normalizedPath === normalizedQuery) {
             rank += 8200;
         } else if (normalizedPath.endsWith(normalizedQuery)) {
@@ -759,6 +1343,8 @@ export class SearchService {
                 rank += 5200 - Math.min(pathIndex, 1000);
             }
         }
+
+        rank += getCompactSubsequenceRank(normalizedPath, normalizedQuery, 3600);
 
         if (typeof item.score === 'number') {
             rank += item.score * 100;
@@ -885,9 +1471,8 @@ export class SearchService {
     }
 }
 
-interface CachedSearchIndex {
+interface CachedSearchIndexHeader {
     version: number;
-    items: CachedSearchItem[];
     recentFiles?: Array<[string, number]>;
 }
 
@@ -939,4 +1524,40 @@ function deserializeRange(range: CachedRange): vscode.Range {
 
 function normalizeSearchText(value: string): string {
     return value.toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+function getCompactSubsequenceRank(text: string, query: string, base: number): number {
+    if (!text || !query || text.includes(query)) {
+        return 0;
+    }
+
+    let firstMatch = -1;
+    let lastMatch = -1;
+    let gapPenalty = 0;
+
+    for (const char of query) {
+        const match = text.indexOf(char, lastMatch + 1);
+
+        if (match === -1) {
+            return 0;
+        }
+
+        if (firstMatch === -1) {
+            firstMatch = match;
+        }
+
+        if (lastMatch >= 0) {
+            gapPenalty += Math.min(match - lastMatch - 1, 20) * 40;
+        }
+
+        lastMatch = match;
+    }
+
+    const span = lastMatch - firstMatch + 1;
+
+    if (span > query.length * 4 + 16) {
+        return 0;
+    }
+
+    return Math.max(0, base - gapPenalty - Math.min(firstMatch, 500));
 }

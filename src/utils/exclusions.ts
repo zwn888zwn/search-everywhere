@@ -33,6 +33,14 @@ export class ExclusionPatterns {
             // Package directories
             '**/packages/**',
             '**/vendor/**',
+            '**/govendor/**',
+            '**/pkg/mod/**',
+            '**/pkg/sumdb/**',
+            '**/src/github.com/**',
+            '**/src/golang.org/**',
+            '**/src/google.golang.org/**',
+            '**/src/go.uber.org/**',
+            '**/src/gopkg.in/**',
 
             // IDE directories
             '**/.idea/**',

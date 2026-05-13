@@ -31,7 +31,8 @@
     "theme": "dark"
   },
   "activationEvents": [
-    "onStartupFinished"
+    "onCommand:search-everywhere.search",
+    "onCommand:search-everywhere.rebuildIndex"
   ],
   "main": "./dist/extension.js",
   "contributes": {
@@ -100,19 +101,19 @@
         "searchEverywhere.performance.maxTextResults": {
           "type": "number",
           "default": 20,
-          "description": "Maximum number of text search results per file"
+          "description": "Maximum number of on-demand text search results"
         },
         "searchEverywhere.performance.maxTextFileSizeBytes": {
           "type": "number",
           "default": 1048576,
           "minimum": 0,
-          "description": "Maximum file size in bytes to include in the text search index"
+          "description": "Deprecated. Text search now uses ripgrep on demand."
         },
         "searchEverywhere.performance.maxTextIndexBytes": {
           "type": "number",
           "default": 20971520,
           "minimum": 0,
-          "description": "Approximate maximum memory in bytes used by the text search index"
+          "description": "Deprecated. Text search no longer builds a persistent line index."
         },
         "searchEverywhere.fuzzySearch.library": {
           "type": "string",
