@@ -77,9 +77,11 @@ export class DocumentSymbolProvider implements SearchProvider {
 
                 // Process symbols recursively
                 this.processSymbols(symbols, uri);
-
-                console.log(`Updated ${symbols.length} symbols for ${uri.fsPath}`);
             }
+
+            await this.addGoFunctionFallbackSymbols(document);
+
+            console.log(`Updated symbols for ${uri.fsPath}`);
         } catch (error) {
             console.error(`Error updating symbols for ${uri.fsPath}:`, error);
         }
@@ -201,11 +203,15 @@ export class DocumentSymbolProvider implements SearchProvider {
                 );
 
                 if (!symbols || symbols.length === 0) {
+                    const document = await vscode.workspace.openTextDocument(uri);
+
+                    await this.addGoFunctionFallbackSymbols(document);
                     continue;
                 }
 
                 // Process symbols recursively
                 this.processSymbols(symbols, uri);
+                await this.addGoFunctionFallbackSymbols(await vscode.workspace.openTextDocument(uri));
             } catch (error) {
                 // Continue with other files if one fails
                 console.error(`Error processing file ${uri.fsPath}:`, error);
@@ -260,6 +266,80 @@ export class DocumentSymbolProvider implements SearchProvider {
                 this.processSymbols(symbol.children, uri, symbol.name);
             }
         }
+    }
+
+    private async addGoFunctionFallbackSymbols(document: vscode.TextDocument): Promise<void> {
+        const uri = document.uri;
+
+        if (!uri.fsPath.endsWith('.go')) {
+            return;
+        }
+
+        for (let lineNumber = 0; lineNumber < document.lineCount; lineNumber++) {
+            const lineText = document.lineAt(lineNumber).text;
+            const match = /^(\s*)func\s+(?:\(([^)]*)\)\s*)?([A-Za-z_]\w*)\s*(?:\[[^\]]+\]\s*)?\(/.exec(lineText);
+
+            if (!match) {
+                continue;
+            }
+
+            const receiver = match[2]?.trim();
+            const name = match[3];
+            const nameOffset = lineText.indexOf(name, match[1].length + 4);
+
+            if (nameOffset < 0) {
+                continue;
+            }
+
+            const kind = receiver ? vscode.SymbolKind.Method : vscode.SymbolKind.Function;
+            const range = new vscode.Range(
+                new vscode.Position(lineNumber, nameOffset),
+                new vscode.Position(lineNumber, nameOffset + name.length)
+            );
+            const symbolItem = this.createSymbolItem(
+                uri,
+                name,
+                kind,
+                range,
+                receiver || ''
+            );
+
+            if (!this.symbolItems.some(item => item.id === symbolItem.id)) {
+                this.symbolItems.push(symbolItem);
+            }
+        }
+    }
+
+    private createSymbolItem(
+        uri: vscode.Uri,
+        name: string,
+        kind: vscode.SymbolKind,
+        range: vscode.Range,
+        containerName: string = ''
+    ): SymbolSearchItem {
+        const symbolGroup = mapSymbolKindToGroup(kind);
+        const isClass = symbolGroup === SymbolKindGroup.Class;
+
+        return {
+            id: `symbol:${name}:${uri.toString()}:${range.start.line}:${range.start.character}`,
+            label: name,
+            description: `${this.getSymbolKindName(kind)}${containerName ? ` - ${containerName}` : ''}`,
+            detail: uri.fsPath,
+            type: isClass ? SearchItemType.Class : SearchItemType.Symbol,
+            uri,
+            range,
+            symbolKind: kind,
+            symbolGroup,
+            priority: this.getSymbolPriority(kind),
+            iconPath: this.getSymbolIcon(kind),
+            action: async () => {
+                const document = await vscode.workspace.openTextDocument(uri);
+                const editor = await vscode.window.showTextDocument(document);
+
+                editor.selection = new vscode.Selection(range.start, range.start);
+                editor.revealRange(range, vscode.TextEditorRevealType.InCenter);
+            }
+        };
     }
 
     /**

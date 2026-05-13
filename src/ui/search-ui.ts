@@ -26,6 +26,7 @@ export class SearchUI {
     private lastQuery: string = '';
     private config = getConfiguration();
     private previewDisposables: vscode.Disposable[] = [];
+    private searchGeneration = 0;
 
     // Active filter category
     private activeFilter: FilterCategory = FilterCategory.All;
@@ -46,6 +47,7 @@ export class SearchUI {
         this.quickPick.placeholder = 'Type to search everywhere (files, classes, symbols...)';
         this.quickPick.matchOnDescription = true;
         this.quickPick.matchOnDetail = true;
+        (this.quickPick as vscode.QuickPick<SearchQuickPickItem> & { sortByLabel: boolean }).sortByLabel = false;
         this.quickPick.ignoreFocusOut = false;
 
         // Create filter category buttons
@@ -305,24 +307,45 @@ export class SearchUI {
      * Execute search and update UI
      */
     private async performSearch(query: string): Promise<void> {
+        const generation = ++this.searchGeneration;
+        const searchFilter = this.activeFilter;
+
         try {
             this.quickPick.busy = true;
 
+            if (!query.trim()) {
+                this.updateSearchItems(await this.searchService.getDefaultItems());
+
+                return;
+            }
+
+            if (searchFilter === FilterCategory.All) {
+                const primaryResults = await this.searchService.search(query, { includeText: false });
+
+                if (!this.isCurrentSearch(query, generation, FilterCategory.All)) {
+                    return;
+                }
+
+                this.updateSearchItems(primaryResults);
+                this.quickPick.busy = false;
+
+                void this.appendTextResults(query, primaryResults, generation);
+
+                return;
+            }
+
             const results = query.trim()
                 ? await this.searchService.search(query, {
-                    includeText: this.activeFilter === FilterCategory.All || this.activeFilter === FilterCategory.Text,
-                    textOnly: this.activeFilter === FilterCategory.Text
+                    includeText: searchFilter === FilterCategory.Text,
+                    textOnly: searchFilter === FilterCategory.Text
                 })
                 : await this.searchService.getDefaultItems();
 
-            // Apply category filters
-            const filteredResults = this.applyCategoryFilter(results);
+            if (!this.isCurrentSearch(query, generation, searchFilter)) {
+                return;
+            }
 
-            // Map to QuickPickItems
-            const items = filteredResults.map(item => this.createQuickPickItem(item));
-
-            // Group items by type
-            this.quickPick.items = this.groupItemsByType(items);
+            this.updateSearchItems(results);
 
         } catch (error) {
             console.error('Error performing search:', error);
@@ -330,6 +353,49 @@ export class SearchUI {
         } finally {
             this.quickPick.busy = false;
         }
+    }
+
+    private async appendTextResults(query: string, primaryResults: SearchItem[], generation: number): Promise<void> {
+        try {
+            const textResults = await this.searchService.searchText(query);
+
+            if (!this.isCurrentSearch(query, generation, FilterCategory.All) || textResults.length === 0) {
+                return;
+            }
+
+            this.updateSearchItems(this.mergeSearchResults(primaryResults, textResults));
+        } catch (error) {
+            console.error('Error appending text search results:', error);
+        }
+    }
+
+    private isCurrentSearch(query: string, generation: number, filter: FilterCategory): boolean {
+        return generation === this.searchGeneration &&
+            query === this.lastQuery &&
+            this.activeFilter === filter;
+    }
+
+    private mergeSearchResults(primaryResults: SearchItem[], textResults: SearchItem[]): SearchItem[] {
+        const seen = new Set<string>();
+        const merged: SearchItem[] = [];
+
+        for (const item of [...primaryResults, ...textResults]) {
+            if (seen.has(item.id)) {
+                continue;
+            }
+
+            seen.add(item.id);
+            merged.push(item);
+        }
+
+        return merged;
+    }
+
+    private updateSearchItems(results: SearchItem[]): void {
+        const filteredResults = this.applyCategoryFilter(results);
+        const items = filteredResults.map(item => this.createQuickPickItem(item));
+
+        this.quickPick.items = this.groupItemsByType(items);
     }
 
     private saveLastQuery(value: string): void {
@@ -595,8 +661,8 @@ export class SearchUI {
             SearchItemType.Class,
             SearchItemType.File,
             SearchItemType.Symbol,
-            SearchItemType.TextMatch,
-            SearchItemType.Command
+            SearchItemType.Command,
+            SearchItemType.TextMatch
         ];
 
         // Add section headers and items in the defined order

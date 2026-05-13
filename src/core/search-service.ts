@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { CommandSearchItem, FileSearchItem, FuzzySearcher, SearchEverywhereConfig, SearchItem, SearchItemType, SearchProvider, SymbolKindGroup, SymbolSearchItem } from './types';
+import { CommandSearchItem, FileSearchItem, FuzzySearcher, SearchEverywhereConfig, SearchItem, SearchItemType, SearchProvider, SymbolKindGroup, SymbolSearchItem, TextMatchItem } from './types';
 import { FileSearchProvider } from '../providers/file-provider';
 import { CommandSearchProvider } from '../providers/command-provider';
 import { DocumentSymbolProvider } from '../providers/document-symbol-provider';
@@ -13,7 +13,7 @@ import { isWorkspaceFile } from '../utils/workspace';
  * Main service for coordinating search functionality
  */
 export class SearchService {
-    private static readonly CACHE_VERSION = 2;
+    private static readonly CACHE_VERSION = 3;
 
     private providers: Map<string, SearchProvider> = new Map();
     private searcher: FuzzySearcher;
@@ -508,34 +508,18 @@ export class SearchService {
      * Search for items matching the query
      */
     public async search(query: string, options: { includeText?: boolean; textOnly?: boolean } = {}): Promise<SearchItem[]> {
-        await this.cacheLoadPromise;
-
-        // If nothing indexed yet, refresh
-        if (this.allItems.length === 0) {
-            await this.refreshIndex();
-        }
+        await this.ensureSearchReady();
 
         if (!query.trim()) {
             return [];
         }
 
+        if (options.textOnly) {
+            return this.searchText(query);
+        }
+
         let results: SearchItem[] = [];
         const queryLimit = Math.min(this.config.performance.maxResults * 5, 1000);
-
-        // Text search uses its own in-memory line index, so include it only for filters that need it.
-        if (this.config.indexing.includeText && options.includeText) {
-            try {
-                const textProvider = this.providers.get('text') as TextSearchProvider;
-
-                if (textProvider) {
-                    const textResults = await textProvider.search(query);
-
-                    results = [...textResults];
-                }
-            } catch (error) {
-                console.error('Error performing text search:', error);
-            }
-        }
 
         // Perform fuzzy search on indexed items
         const fuzzyResults = await this.searcher.search(
@@ -545,14 +529,23 @@ export class SearchService {
         );
         const pathResults = this.searchPathMatches(query, queryLimit);
 
-        // Combine fuzzy, explicit path, and optional text results.
-        results = this.deduplicateResults([...results, ...fuzzyResults, ...pathResults]);
+        // Combine fuzzy and explicit path results first so UI can show them immediately.
+        results = this.deduplicateResults([...fuzzyResults, ...pathResults]);
+
+        // Text search uses its own in-memory line index. It is intentionally last because
+        // large workspaces can make full-text matching noticeably slower than item lookup.
+        if (this.config.indexing.includeText && options.includeText) {
+            const textResults = await this.searchText(query);
+
+            results = this.deduplicateResults([...results, ...textResults]);
+        }
+
         // Boost recently modified files
         if (this.config.activity.enabled && this.recentlyModifiedFiles.size > 0) {
             this.boostRecentlyModifiedItems(results);
         }
         // Apply IDEA-style ranking across labels, paths, symbols, and text matches.
-        this.sortResultsByRelevance(results, query, options.textOnly === true);
+        this.sortResultsByRelevance(results, query, false);
 
         if (!options.textOnly) {
             results = this.moveTextMatchesToBottom(results);
@@ -560,6 +553,90 @@ export class SearchService {
 
         // Limit to max results
         return results.slice(0, this.config.performance.maxResults);
+    }
+
+    public async searchText(query: string): Promise<SearchItem[]> {
+        await this.ensureSearchReady();
+
+        if (!query.trim() || !this.config.indexing.includeText) {
+            return [];
+        }
+
+        try {
+            const textProvider = this.providers.get('text') as TextSearchProvider;
+
+            if (!textProvider) {
+                return [];
+            }
+
+            const textResults = (await textProvider.search(query))
+                .map(item => this.convertGoFunctionTextMatch(item));
+
+            this.sortResultsByRelevance(textResults, query, true);
+
+            return textResults.slice(0, this.config.performance.maxTextResults);
+        } catch (error) {
+            console.error('Error performing text search:', error);
+
+            return [];
+        }
+    }
+
+    private async ensureSearchReady(): Promise<void> {
+        await this.cacheLoadPromise;
+
+        // If nothing indexed yet, refresh
+        if (this.allItems.length === 0) {
+            await this.refreshIndex();
+        }
+    }
+
+    private convertGoFunctionTextMatch(item: TextMatchItem): SearchItem {
+        if (!item.uri.fsPath.endsWith('.go')) {
+            return item;
+        }
+
+        const lineText = item.lineText || item.label;
+        const match = /^(\s*)func\s+(?:\(([^)]*)\)\s*)?([A-Za-z_]\w*)\s*(?:\[[^\]]+\]\s*)?\(/.exec(lineText);
+
+        if (!match) {
+            return item;
+        }
+
+        const receiver = match[2]?.trim();
+        const name = match[3];
+        const nameOffset = lineText.indexOf(name, match[1].length + 4);
+
+        if (nameOffset < 0) {
+            return item;
+        }
+
+        const kind = receiver ? vscode.SymbolKind.Method : vscode.SymbolKind.Function;
+        const start = new vscode.Position(item.range.start.line, nameOffset);
+        const end = new vscode.Position(item.range.start.line, nameOffset + name.length);
+        const range = new vscode.Range(start, end);
+        const symbolItem: SymbolSearchItem = {
+            id: `symbol:${name}:${item.uri.toString()}:${range.start.line}:${range.start.character}`,
+            label: name,
+            description: receiver ? `Method - ${receiver}` : 'Function',
+            detail: item.uri.fsPath,
+            type: SearchItemType.Symbol,
+            uri: item.uri,
+            range,
+            symbolKind: kind,
+            symbolGroup: SymbolKindGroup.Function,
+            priority: 90,
+            iconPath: new vscode.ThemeIcon('symbol-method'),
+            action: async () => {
+                const document = await vscode.workspace.openTextDocument(item.uri);
+                const editor = await vscode.window.showTextDocument(document);
+
+                editor.selection = new vscode.Selection(range.start, range.start);
+                editor.revealRange(range, vscode.TextEditorRevealType.InCenter);
+            }
+        };
+
+        return symbolItem;
     }
 
     private moveTextMatchesToBottom(results: SearchItem[]): SearchItem[] {
