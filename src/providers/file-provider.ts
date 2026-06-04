@@ -58,12 +58,10 @@ export class FileSearchProvider implements SearchProvider {
                 return;
             }
 
-            // Get exclusion glob pattern from utility
-            const excludePattern = ExclusionPatterns.getExclusionGlob();
-
             // Process each workspace folder
             for (const folder of vscode.workspace.workspaceFolders) {
                 console.log(`Indexing files in workspace folder: ${folder.name}`);
+                const excludePattern = ExclusionPatterns.getExclusionGlob(folder);
 
                 // Find all files in the workspace folder
                 const files = await vscode.workspace.findFiles(

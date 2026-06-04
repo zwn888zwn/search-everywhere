@@ -6,11 +6,16 @@ import Logger from './logging';
 import { minimatch } from 'minimatch';
 import { isWorkspaceFile } from './workspace';
 
+interface GitIgnoreRule {
+    basePath: string;
+    pattern: string;
+}
+
 /**
  * Utility for managing exclusion patterns that are shared across providers
  */
 export class ExclusionPatterns {
-    private static gitIgnoreCache = new Map<string, string[]>();
+    private static gitIgnoreCache = new Map<string, GitIgnoreRule[]>();
 
     /**
      * Get the default exclusion patterns plus any user-configured ones
@@ -115,13 +120,22 @@ export class ExclusionPatterns {
     /**
      * Get the exclusion pattern string for use with vscode.workspace.findFiles
      */
-    public static getExclusionGlob(): string {
-        const patterns = this.getExclusionPatterns();
+    public static getExclusionGlob(workspaceFolder?: vscode.WorkspaceFolder): string {
+        const patterns = workspaceFolder
+            ? this.getSearchExcludePatterns(workspaceFolder)
+            : this.getExclusionPatterns();
         const glob = `{${patterns.join(',')}}`;
 
         Logger.debug(`Generated exclusion glob pattern with ${patterns.length} patterns`);
 
         return glob;
+    }
+
+    public static getSearchExcludePatterns(workspaceFolder: vscode.WorkspaceFolder): string[] {
+        return [
+            ...this.getExclusionPatterns(),
+            ...this.getGitIgnoreGlobPatterns(workspaceFolder)
+        ];
     }
 
     /**
@@ -183,14 +197,21 @@ export class ExclusionPatterns {
     }
 
     private static isIgnoredByGitIgnore(workspaceFolder: vscode.WorkspaceFolder, relativePath: string): boolean {
-        const patterns = this.getGitIgnorePatterns(workspaceFolder);
+        const rules = this.getGitIgnoreRules(workspaceFolder);
         let ignored = false;
 
-        for (const pattern of patterns) {
+        for (const rule of rules) {
+            const scopedPath = this.toScopedRelativePath(relativePath, rule.basePath);
+
+            if (scopedPath === undefined) {
+                continue;
+            }
+
+            const pattern = rule.pattern;
             const negated = pattern.startsWith('!');
             const rawPattern = negated ? pattern.substring(1) : pattern;
 
-            if (this.matchesGitIgnorePattern(relativePath, rawPattern)) {
+            if (this.matchesGitIgnorePattern(scopedPath, rawPattern)) {
                 ignored = !negated;
             }
         }
@@ -198,7 +219,7 @@ export class ExclusionPatterns {
         return ignored;
     }
 
-    private static getGitIgnorePatterns(workspaceFolder: vscode.WorkspaceFolder): string[] {
+    private static getGitIgnoreRules(workspaceFolder: vscode.WorkspaceFolder): GitIgnoreRule[] {
         const workspacePath = workspaceFolder.uri.fsPath;
         const cached = this.gitIgnoreCache.get(workspacePath);
 
@@ -206,18 +227,12 @@ export class ExclusionPatterns {
             return cached;
         }
 
-        const gitIgnorePath = path.join(workspacePath, '.gitignore');
-
         try {
-            const content = fs.readFileSync(gitIgnorePath, 'utf8');
-            const patterns = content
-                .split(/\r?\n/)
-                .map(line => line.trim())
-                .filter(line => line && !line.startsWith('#'));
+            const rules = this.collectGitIgnoreRules(workspacePath);
 
-            this.gitIgnoreCache.set(workspacePath, patterns);
+            this.gitIgnoreCache.set(workspacePath, rules);
 
-            return patterns;
+            return rules;
         } catch {
             this.gitIgnoreCache.set(workspacePath, []);
 
@@ -225,11 +240,79 @@ export class ExclusionPatterns {
         }
     }
 
-    private static matchesGitIgnorePattern(relativePath: string, pattern: string): boolean {
-        let normalizedPattern = pattern.replace(/\\/g, '/');
+    private static getGitIgnoreGlobPatterns(workspaceFolder: vscode.WorkspaceFolder): string[] {
+        const rules = this.getGitIgnoreRules(workspaceFolder);
+        const expanded = new Set<string>();
+
+        for (const rule of rules) {
+            const pattern = rule.pattern;
+
+            if (pattern.startsWith('!')) {
+                continue;
+            }
+
+            for (const candidate of this.expandGitIgnorePatternToGlobs(pattern, rule.basePath)) {
+                expanded.add(candidate);
+            }
+        }
+
+        return [...expanded];
+    }
+
+    private static collectGitIgnoreRules(workspacePath: string): GitIgnoreRule[] {
+        const rules: GitIgnoreRule[] = [];
+        const stack = [''];
+        const skippedDirs = new Set(['.git', 'node_modules']);
+
+        while (stack.length > 0) {
+            const relativeDir = stack.pop()!;
+            const absoluteDir = path.join(workspacePath, relativeDir);
+            const gitIgnorePath = path.join(absoluteDir, '.gitignore');
+
+            if (fs.existsSync(gitIgnorePath)) {
+                const content = fs.readFileSync(gitIgnorePath, 'utf8');
+                const patterns = content
+                    .split(/\r?\n/)
+                    .map(line => line.trim())
+                    .filter(line => line && !line.startsWith('#'));
+
+                for (const pattern of patterns) {
+                    rules.push({
+                        basePath: relativeDir.split(path.sep).join('/'),
+                        pattern
+                    });
+                }
+            }
+
+            let entries: fs.Dirent[];
+
+            try {
+                entries = fs.readdirSync(absoluteDir, { withFileTypes: true });
+            } catch {
+                continue;
+            }
+
+            for (const entry of entries) {
+                if (!entry.isDirectory() || skippedDirs.has(entry.name)) {
+                    continue;
+                }
+
+                const childRelativeDir = relativeDir
+                    ? path.posix.join(relativeDir.split(path.sep).join('/'), entry.name)
+                    : entry.name;
+
+                stack.push(childRelativeDir);
+            }
+        }
+
+        return rules;
+    }
+
+    private static expandGitIgnorePatternToGlobs(pattern: string, basePath: string): string[] {
+        let normalizedPattern = pattern.replace(/\\/g, '/').trim();
 
         if (!normalizedPattern) {
-            return false;
+            return [];
         }
 
         if (normalizedPattern.startsWith('/')) {
@@ -242,17 +325,53 @@ export class ExclusionPatterns {
             normalizedPattern = normalizedPattern.slice(0, -1);
         }
 
+        if (!normalizedPattern) {
+            return [];
+        }
+
         const hasSlash = normalizedPattern.includes('/');
-        const candidates = hasSlash
+        const relativeCandidates = hasSlash
             ? [normalizedPattern, `${normalizedPattern}/**`]
             : [normalizedPattern, `**/${normalizedPattern}`, `**/${normalizedPattern}/**`];
 
         if (directoryOnly) {
-            candidates.push(`${normalizedPattern}/**`);
-            candidates.push(`**/${normalizedPattern}/**`);
+            relativeCandidates.push(`${normalizedPattern}/**`);
+            relativeCandidates.push(`**/${normalizedPattern}/**`);
         }
 
-        return candidates.some(candidate =>
+        return [...new Set(relativeCandidates.map(candidate => this.prefixGitIgnoreGlob(basePath, candidate)))];
+    }
+
+    private static prefixGitIgnoreGlob(basePath: string, candidate: string): string {
+        if (!basePath) {
+            return candidate;
+        }
+
+        if (candidate.startsWith('**/')) {
+            return `${basePath}/${candidate}`;
+        }
+
+        return `${basePath}/${candidate}`;
+    }
+
+    private static toScopedRelativePath(relativePath: string, basePath: string): string | undefined {
+        if (!basePath) {
+            return relativePath;
+        }
+
+        if (relativePath === basePath) {
+            return '';
+        }
+
+        if (!relativePath.startsWith(`${basePath}/`)) {
+            return undefined;
+        }
+
+        return relativePath.substring(basePath.length + 1);
+    }
+
+    private static matchesGitIgnorePattern(relativePath: string, pattern: string): boolean {
+        return this.expandGitIgnorePatternToGlobs(pattern, '').some(candidate =>
             minimatch(relativePath, candidate, {
                 dot: true,
                 matchBase: !candidate.includes('/'),

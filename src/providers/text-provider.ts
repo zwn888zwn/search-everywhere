@@ -22,6 +22,13 @@ interface RgMatch {
     };
 }
 
+interface TextSearchQueryPlan {
+    pattern: string;
+    useRegex: boolean;
+}
+
+const RG_EXECUTABLE_NAME = process.platform === 'win32' ? 'rg.exe' : 'rg';
+
 /**
  * Provides full-text results through ripgrep on demand.
  *
@@ -86,9 +93,66 @@ export class TextSearchProvider implements SearchProvider {
     }
 
     private async searchFolder(folder: vscode.WorkspaceFolder, query: string, limit: number): Promise<TextMatchItem[]> {
+        const plans = buildTextSearchQueryPlans(query);
+        const dedupedResults = new Map<string, TextMatchItem>();
+
+        for (const plan of plans) {
+            if (dedupedResults.size >= limit) {
+                break;
+            }
+
+            const planResults = await this.runTextSearch(folder, query, plan, limit - dedupedResults.size);
+
+            for (const item of planResults) {
+                dedupedResults.set(item.id, item);
+            }
+        }
+
+        return [...dedupedResults.values()];
+    }
+
+    private getRgCommand(): string {
+        for (const candidate of getBundledRgCandidates(vscode.env.appRoot, process.platform, process.arch)) {
+            if (fs.existsSync(candidate)) {
+                return candidate;
+            }
+        }
+
+        return 'rg';
+    }
+
+    private buildRgArgs(folder: vscode.WorkspaceFolder, plan: TextSearchQueryPlan): string[] {
+        const args = [
+            '--json',
+            '--ignore-case',
+            '--line-number',
+            '--column',
+            '--max-count',
+            '3',
+            plan.pattern,
+            '.'
+        ];
+
+        if (!plan.useRegex) {
+            args.splice(1, 0, '--fixed-strings');
+        }
+
+        for (const pattern of ExclusionPatterns.getSearchExcludePatterns(folder)) {
+            args.splice(args.length - 2, 0, '--glob', `!${pattern}`);
+        }
+
+        return args;
+    }
+
+    private async runTextSearch(
+        folder: vscode.WorkspaceFolder,
+        query: string,
+        plan: TextSearchQueryPlan,
+        limit: number
+    ): Promise<TextMatchItem[]> {
         return new Promise(resolve => {
             const results: TextMatchItem[] = [];
-            const args = this.buildRgArgs(query);
+            const args = this.buildRgArgs(folder, plan);
             const child = spawn(this.getRgCommand(), args, {
                 cwd: folder.uri.fsPath,
                 windowsHide: true
@@ -130,36 +194,6 @@ export class TextSearchProvider implements SearchProvider {
                 resolve(results);
             });
         });
-    }
-
-    private getRgCommand(): string {
-        const bundledRg = path.join(vscode.env.appRoot, 'node_modules', '@vscode', 'ripgrep', 'bin', process.platform === 'win32' ? 'rg.exe' : 'rg');
-
-        if (fs.existsSync(bundledRg)) {
-            return bundledRg;
-        }
-
-        return 'rg';
-    }
-
-    private buildRgArgs(query: string): string[] {
-        const args = [
-            '--json',
-            '--fixed-strings',
-            '--ignore-case',
-            '--line-number',
-            '--column',
-            '--max-count',
-            '3',
-            query,
-            '.'
-        ];
-
-        for (const pattern of ExclusionPatterns.getExclusionPatterns()) {
-            args.splice(args.length - 2, 0, '--glob', `!${pattern}`);
-        }
-
-        return args;
     }
 
     private processRgOutput(
@@ -242,5 +276,89 @@ export class TextSearchProvider implements SearchProvider {
             iconPath: new vscode.ThemeIcon('file-text'),
             priority: 30
         };
+    }
+}
+
+export function buildTextSearchQueryPlans(query: string): TextSearchQueryPlan[] {
+    const normalizedQuery = query.trim();
+
+    if (!normalizedQuery) {
+        return [];
+    }
+
+    const plans: TextSearchQueryPlan[] = [{
+        pattern: normalizedQuery,
+        useRegex: false
+    }];
+    const flexiblePattern = buildFlexibleSeparatorPattern(normalizedQuery);
+
+    if (flexiblePattern && flexiblePattern !== normalizedQuery) {
+        plans.push({
+            pattern: flexiblePattern,
+            useRegex: true
+        });
+    }
+
+    return plans;
+}
+
+function buildFlexibleSeparatorPattern(query: string): string | undefined {
+    if (!/\s/.test(query)) {
+        return undefined;
+    }
+
+    const parts = query
+        .trim()
+        .split(/\s+/)
+        .filter(Boolean)
+        .map(escapeRegex);
+
+    if (parts.length < 2) {
+        return undefined;
+    }
+
+    return parts.join('[\\s_-]*');
+}
+
+function escapeRegex(value: string): string {
+    return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+export function getBundledRgCandidates(appRoot: string, platform: NodeJS.Platform, arch: string): string[] {
+    const resourceRoot = path.dirname(appRoot);
+    const platformDir = getRgPlatformDir(platform, arch);
+
+    return [
+        path.join(appRoot, 'node_modules', '@vscode', 'ripgrep', 'bin', platform === 'win32' ? 'rg.exe' : 'rg'),
+        path.join(appRoot, 'node_modules', '@vscode', 'ripgrep-universal', 'bin', platformDir, RG_EXECUTABLE_NAME),
+        path.join(resourceRoot, RG_EXECUTABLE_NAME)
+    ];
+}
+
+function getRgPlatformDir(platform: NodeJS.Platform, arch: string): string {
+    switch (platform) {
+        case 'darwin':
+            return arch === 'arm64' ? 'darwin-arm64' : 'darwin-x64';
+
+        case 'win32':
+            if (arch === 'arm64') {
+                return 'win32-arm64';
+            }
+
+            return arch === 'x64' ? 'win32-x64' : 'win32-ia32';
+
+        case 'linux':
+            if (arch === 'arm64') {
+                return 'linux-arm64';
+            }
+
+            if (arch === 'arm') {
+                return 'linux-armhf';
+            }
+
+            return 'linux-x64';
+
+        default:
+            return `${platform}-${arch}`;
     }
 }

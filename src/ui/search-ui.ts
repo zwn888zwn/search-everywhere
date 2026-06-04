@@ -672,6 +672,7 @@ export class SearchUI {
             label: label,
             description: description,
             detail: detail,
+            alwaysShow: true,
             iconPath: item.iconPath instanceof vscode.ThemeIcon ? item.iconPath : undefined,
             originalItem: item,
             type: item.type

@@ -504,7 +504,7 @@ export class SearchService {
     private async findFunctionCandidatesInFolder(folder: vscode.WorkspaceFolder, query: string, limit: number): Promise<SymbolSearchItem[]> {
         return new Promise(resolve => {
             const results: SymbolSearchItem[] = [];
-            const args = this.buildFunctionQueryRgArgs(query);
+            const args = this.buildFunctionQueryRgArgs(folder, query);
             const child = spawn(this.getRgCommand(), args, {
                 cwd: folder.uri.fsPath,
                 windowsHide: true
@@ -541,7 +541,7 @@ export class SearchService {
         });
     }
 
-    private buildFunctionQueryRgArgs(query: string): string[] {
+    private buildFunctionQueryRgArgs(folder: vscode.WorkspaceFolder, query: string): string[] {
         const args = [
             '--json',
             '--ignore-case',
@@ -558,7 +558,7 @@ export class SearchService {
             args.splice(args.length - 1, 0, '--glob', pattern);
         }
 
-        for (const pattern of ExclusionPatterns.getExclusionPatterns()) {
+        for (const pattern of ExclusionPatterns.getSearchExcludePatterns(folder)) {
             args.splice(args.length - 1, 0, '--glob', `!${pattern}`);
         }
 

@@ -144,10 +144,9 @@ export class DocumentSymbolProvider implements SearchProvider {
             // Focus on common source code extensions to avoid scanning too many files
             const sourceFilePattern = '**/*.{go,py,java,c,h,cpp,hpp,js,jsx,ts,tsx,vue}';
 
-            // Get exclusion pattern from utility
-            const excludePattern = ExclusionPatterns.getExclusionGlob();
-
             for (const folder of vscode.workspace.workspaceFolders) {
+                const excludePattern = ExclusionPatterns.getExclusionGlob(folder);
+
                 // Find source code files in this workspace folder
                 const files = await vscode.workspace.findFiles(
                     new vscode.RelativePattern(folder, sourceFilePattern),
