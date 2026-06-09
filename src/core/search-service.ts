@@ -30,6 +30,12 @@ interface ParsedFunction {
     isMethod: boolean;
 }
 
+interface FileLocationQuery {
+    pathQuery: string;
+    line: number;
+    column?: number;
+}
+
 /**
  * Main service for coordinating search functionality
  */
@@ -1030,32 +1036,44 @@ export class SearchService {
     public async search(query: string, options: { includeText?: boolean; includeFunctions?: boolean; textOnly?: boolean } = {}): Promise<SearchItem[]> {
         this.startIndexing();
 
-        if (!query.trim()) {
+        const trimmedQuery = query.trim();
+
+        if (!trimmedQuery) {
             return [];
         }
 
+        const fileLocationQuery = parseFileLocationQuery(trimmedQuery);
+        const searchQuery = fileLocationQuery?.pathQuery || trimmedQuery;
+
         if (options.textOnly) {
-            return this.searchText(query);
+            return this.searchText(searchQuery);
         }
 
         await this.cacheLoadPromise;
 
         let results: SearchItem[] = [];
         const queryLimit = Math.min(this.config.performance.maxResults * 5, 1000);
+        const directFileResults = fileLocationQuery
+            ? this.findDirectFileLocationMatches(fileLocationQuery, queryLimit)
+            : [];
 
         // Perform fuzzy search on indexed items
         const fuzzyResults = await this.searcher.search(
             this.allItems,
-            query,
+            searchQuery,
             queryLimit
         );
-        const compactSubsequenceResults = this.searchCompactSubsequenceMatches(query, queryLimit);
+        const compactSubsequenceResults = this.searchCompactSubsequenceMatches(searchQuery, queryLimit);
 
         // The active matcher scores both label and path, so keep this to one full scan.
-        results = this.deduplicateResults([...fuzzyResults, ...compactSubsequenceResults]);
+        results = this.deduplicateResults([...directFileResults, ...fuzzyResults, ...compactSubsequenceResults]);
 
-        if (options.includeFunctions !== false && this.shouldSearchFunctionNamesOnDemand(query, results.length)) {
-            const functionResults = await this.searchFunctionNamesOnDemand(query, queryLimit);
+        if (fileLocationQuery) {
+            results = results.map(item => this.applyFileLocationToSearchItem(item, fileLocationQuery));
+        }
+
+        if (options.includeFunctions !== false && this.shouldSearchFunctionNamesOnDemand(searchQuery, results.length)) {
+            const functionResults = await this.searchFunctionNamesOnDemand(searchQuery, queryLimit);
 
             results = this.deduplicateResults([...results, ...functionResults]);
         }
@@ -1063,7 +1081,7 @@ export class SearchService {
         // Text search uses its own in-memory line index. It is intentionally last because
         // large workspaces can make full-text matching noticeably slower than item lookup.
         if (this.config.indexing.includeText && options.includeText) {
-            const textResults = await this.searchText(query);
+            const textResults = await this.searchText(searchQuery);
 
             results = this.deduplicateResults([...results, ...textResults]);
         }
@@ -1073,7 +1091,7 @@ export class SearchService {
             this.boostRecentlyModifiedItems(results);
         }
         // Apply IDEA-style ranking across labels, paths, symbols, and text matches.
-        this.sortResultsByRelevance(results, query, false);
+        this.sortResultsByRelevance(results, searchQuery, false);
 
         if (!options.textOnly) {
             results = this.moveTextMatchesToBottom(results);
@@ -1110,6 +1128,80 @@ export class SearchService {
 
     public async searchFunctionNames(query: string, limit: number = this.config.performance.maxResults): Promise<SearchItem[]> {
         return this.searchFunctionNamesOnDemand(query, limit);
+    }
+
+    private findDirectFileLocationMatches(fileLocationQuery: FileLocationQuery, limit: number): FileSearchItem[] {
+        const normalizedPathQuery = normalizeSearchText(fileLocationQuery.pathQuery);
+        const matches: Array<{ item: FileSearchItem; rank: number }> = [];
+        const fileItems = this.allItems.filter((item): item is FileSearchItem =>
+            item.type === SearchItemType.File &&
+            'uri' in item &&
+            item.uri instanceof vscode.Uri
+        );
+
+        for (const item of fileItems) {
+            const normalizedPath = normalizeSearchText(item.description || vscode.workspace.asRelativePath(item.uri));
+            let rank = 0;
+
+            if (normalizedPath === normalizedPathQuery) {
+                rank = 12000;
+            } else if (normalizedPath.endsWith(`/${normalizedPathQuery}`) || normalizedPath.endsWith(normalizedPathQuery)) {
+                rank = 11000;
+            } else if (normalizedPath.includes(normalizedPathQuery)) {
+                rank = 9000;
+            }
+
+            if (rank <= 0) {
+                continue;
+            }
+
+            matches.push({
+                item: this.applyFileLocationToFileItem(item, fileLocationQuery, 2400),
+                rank
+            });
+        }
+
+        matches.sort((a, b) => b.rank - a.rank || a.item.label.localeCompare(b.item.label));
+
+        return matches.slice(0, limit).map(match => match.item);
+    }
+
+    private applyFileLocationToSearchItem(item: SearchItem, fileLocationQuery: FileLocationQuery, priorityBoost: number = 1400): SearchItem {
+        if (item.type !== SearchItemType.File || !('uri' in item) || !(item.uri instanceof vscode.Uri)) {
+            return item;
+        }
+
+        return this.applyFileLocationToFileItem(item as FileSearchItem, fileLocationQuery, priorityBoost);
+    }
+
+    private applyFileLocationToFileItem(fileItem: FileSearchItem, fileLocationQuery: FileLocationQuery, priorityBoost: number = 1400): FileSearchItem {
+        const line = Math.max(1, fileLocationQuery.line);
+        const column = Math.max(1, fileLocationQuery.column || 1);
+        const position = new vscode.Position(line - 1, column - 1);
+        const range = new vscode.Range(position, position);
+
+        return {
+            ...fileItem,
+            id: `${fileItem.id}:${line}:${column}`,
+            range,
+            priority: (fileItem.priority || 0) + priorityBoost,
+            action: async () => {
+                await this.openFileAtLocation(fileItem.uri, line, column);
+            }
+        };
+    }
+
+    private async openFileAtLocation(uri: vscode.Uri, line: number, column: number): Promise<void> {
+        const document = await vscode.workspace.openTextDocument(uri);
+        const targetLine = Math.min(Math.max(line - 1, 0), Math.max(document.lineCount - 1, 0));
+        const lineText = document.lineAt(targetLine).text;
+        const targetColumn = Math.min(Math.max(column - 1, 0), lineText.length);
+        const position = new vscode.Position(targetLine, targetColumn);
+        const range = new vscode.Range(position, position);
+        const editor = await vscode.window.showTextDocument(document);
+
+        editor.selection = new vscode.Selection(position, position);
+        editor.revealRange(range, vscode.TextEditorRevealType.InCenter);
     }
 
     private convertGoFunctionTextMatch(item: TextMatchItem): SearchItem {
@@ -1520,6 +1612,36 @@ function deserializeRange(range: CachedRange): vscode.Range {
         new vscode.Position(range.start.line, range.start.character),
         new vscode.Position(range.end.line, range.end.character)
     );
+}
+
+function parseFileLocationQuery(query: string): FileLocationQuery | undefined {
+    const match = /^(.*):(\d+)(?::(\d+))?$/.exec(query.trim());
+
+    if (!match) {
+        return undefined;
+    }
+
+    const pathQuery = match[1].trim();
+    const line = Number.parseInt(match[2], 10);
+    const column = match[3] ? Number.parseInt(match[3], 10) : undefined;
+
+    if (!pathQuery || !Number.isFinite(line) || line < 1) {
+        return undefined;
+    }
+
+    if (!/[\\/]/.test(pathQuery) && !/\.[^./\\:]+$/.test(pathQuery)) {
+        return undefined;
+    }
+
+    if (column !== undefined && (!Number.isFinite(column) || column < 1)) {
+        return undefined;
+    }
+
+    return {
+        pathQuery,
+        line,
+        column
+    };
 }
 
 function normalizeSearchText(value: string): string {

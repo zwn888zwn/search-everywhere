@@ -7,7 +7,7 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 import { SearchService } from '../core/search-service';
 import { FilterCategory, SearchUI } from '../ui/search-ui';
-import { SearchItemType, TextMatchItem } from '../core/types';
+import { FileSearchItem, SearchItemType, TextMatchItem } from '../core/types';
 import { buildTextSearchQueryPlans, getBundledRgCandidates } from '../providers/text-provider';
 // import * as myExtension from '../../extension';
 
@@ -170,5 +170,16 @@ suite('Extension Test Suite', () => {
 		assert.ok(visibleItems.some(item =>
 			`${item.label} ${item.description || ''} ${item.detail || ''}`.toLowerCase().includes('skip level')
 		));
+	});
+
+	test('File path queries with :line jump to the requested line', async () => {
+		const searchService = new SearchService(context);
+		const results = await searchService.search('src/skip_level.go:3');
+		const fileResult = results.find(item => item.type === SearchItemType.File) as FileSearchItem | undefined;
+
+		assert.ok(fileResult, 'expected a file result for path:line query');
+		assert.ok(fileResult.range instanceof vscode.Range, 'expected a target range on the file result');
+		assert.strictEqual(fileResult.range?.start.line, 2);
+		assert.strictEqual(fileResult.range?.start.character, 0);
 	});
 });
