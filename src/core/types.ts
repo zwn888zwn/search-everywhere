@@ -81,6 +81,7 @@ export interface FileSearchItem extends SearchItem {
     type: SearchItemType.File;
     uri: vscode.Uri;
     range?: vscode.Range;
+    isDirectory?: boolean;
     // Optional relativePath allows for backward compatibility
     relativePath?: string;
 }

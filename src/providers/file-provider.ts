@@ -7,6 +7,7 @@ import { ExclusionPatterns } from '../utils/exclusions';
  */
 export class FileSearchProvider implements SearchProvider {
     private fileItems: FileSearchItem[] = [];
+    private indexedDirectories = new Set<string>();
     private isRefreshing: boolean = false;
     private isPartial: boolean = false;
 
@@ -49,6 +50,7 @@ export class FileSearchProvider implements SearchProvider {
         const startTime = performance.now();
 
         this.fileItems = [];
+        this.indexedDirectories.clear();
         this.isPartial = Boolean(maxFiles);
 
         try {
@@ -126,6 +128,8 @@ export class FileSearchProvider implements SearchProvider {
                 // Get file name
                 const fileName = uri.fsPath.split(/[\/\\]/).pop() || '';
 
+                this.addParentDirectories(workspaceFolder, relativePath);
+
                 // Add file item
                 this.fileItems.push({
                     id: `file:${uri.toString()}`,
@@ -143,6 +147,36 @@ export class FileSearchProvider implements SearchProvider {
             } catch (error) {
                 console.error(`Error processing file ${uri.fsPath}:`, error);
             }
+        }
+    }
+
+    private addParentDirectories(workspaceFolder: vscode.WorkspaceFolder, relativeFilePath: string): void {
+        const parts = relativeFilePath.split(/[\/\\]/).filter(Boolean);
+
+        for (let depth = 1; depth < parts.length; depth++) {
+            const directoryPath = parts.slice(0, depth).join('/');
+            const uri = vscode.Uri.joinPath(workspaceFolder.uri, ...parts.slice(0, depth));
+            const key = uri.toString();
+
+            if (this.indexedDirectories.has(key)) {
+                continue;
+            }
+
+            this.indexedDirectories.add(key);
+            this.fileItems.push({
+                id: `directory:${key}`,
+                label: parts[depth - 1],
+                description: directoryPath,
+                detail: uri.fsPath,
+                type: SearchItemType.File,
+                uri,
+                isDirectory: true,
+                priority: 80,
+                iconPath: new vscode.ThemeIcon('folder'),
+                action: async () => {
+                    await vscode.commands.executeCommand('revealInExplorer', uri);
+                }
+            });
         }
     }
 

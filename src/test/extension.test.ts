@@ -1,4 +1,5 @@
 import * as assert from 'assert';
+import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 
@@ -6,9 +7,13 @@ import * as path from 'path';
 // as well as import your extension to test it
 import * as vscode from 'vscode';
 import { SearchService } from '../core/search-service';
+import { parseSearchQuery } from '../core/search-query';
 import { FilterCategory, SearchUI } from '../ui/search-ui';
-import { FileSearchItem, SearchItemType, TextMatchItem } from '../core/types';
-import { buildTextSearchQueryPlans, getBundledRgCandidates } from '../providers/text-provider';
+import { FileSearchItem, SearchItem, SearchItemType, SymbolSearchItem, TextMatchItem } from '../core/types';
+import { buildTextSearchQueryPlans, getBundledRgCandidates, TextSearchProvider } from '../providers/text-provider';
+import { FileSearchProvider } from '../providers/file-provider';
+import { SymbolSearchProvider } from '../providers/symbol-provider';
+import { FuzzysortAdapter } from '../search/fuzzysort-adapter';
 // import * as myExtension from '../../extension';
 
 class InMemoryMemento implements vscode.Memento {
@@ -93,15 +98,280 @@ suite('Extension Test Suite', () => {
 		]);
 	});
 
+	test('Quoted queries use the unquoted term for names and quoted text for content', () => {
+		assert.deepStrictEqual(parseSearchQuery('  "sent"  '), {
+			raw: '"sent"',
+			term: 'sent',
+			textPattern: '"sent"',
+			exact: true
+		});
+	});
+
 	test('Bundled ripgrep candidate list covers current VS Code layout', () => {
 		assert.deepStrictEqual(
 			getBundledRgCandidates('/mock/app', 'darwin', 'arm64'),
 			[
 				'/mock/app/node_modules/@vscode/ripgrep/bin/rg',
 				'/mock/app/node_modules/@vscode/ripgrep-universal/bin/darwin-arm64/rg',
+				'/mock/app/node_modules.asar.unpacked/@vscode/ripgrep-universal/bin/darwin-arm64/rg',
 				'/mock/rg'
 			]
 		);
+	});
+
+	test('Text search resolves a ripgrep binary from the running VS Code installation', () => {
+		const candidates = getBundledRgCandidates(vscode.env.appRoot, process.platform, process.arch);
+
+		assert.ok(candidates.some(candidate => fs.existsSync(candidate)), 'expected an installed VS Code ripgrep binary');
+	});
+
+	test('File provider contributes parent directories for path search', async () => {
+		const provider = new FileSearchProvider();
+
+		await provider.refresh();
+
+		const directory = (await provider.getItems()).find(item =>
+			item.isDirectory && item.label === 'src' && item.description === 'src'
+		);
+
+		assert.ok(directory, 'expected the src directory as a searchable path result');
+		assert.strictEqual((directory!.iconPath as vscode.ThemeIcon).id, 'folder');
+	});
+
+	test('Fuzzy search does not treat priority-only items as matches', async () => {
+		const item: FileSearchItem = {
+			id: 'directory:unrelated',
+			type: SearchItemType.File,
+			label: '.openapi-generator',
+			description: 'client/.openapi-generator',
+			detail: '/tmp/client/.openapi-generator',
+			uri: vscode.Uri.file('/tmp/client/.openapi-generator'),
+			isDirectory: true,
+			priority: 80,
+			action: async () => {}
+		};
+
+		assert.deepStrictEqual(await new FuzzysortAdapter().search([item], 'zwn'), []);
+	});
+
+	test('Symbol provider runs one request and keeps only the latest queued query', async () => {
+		const provider = new SymbolSearchProvider();
+		const releases = new Map<string, () => void>();
+		const calls: string[] = [];
+		let active = 0;
+		let maxActive = 0;
+		const createSymbol = (label: string): SymbolSearchItem => ({
+			id: `symbol:${label}`,
+			type: SearchItemType.Symbol,
+			label,
+			description: 'Function',
+			detail: '/tmp/test.go',
+			uri: vscode.Uri.file('/tmp/test.go'),
+			range: new vscode.Range(0, 0, 0, label.length),
+			symbolKind: vscode.SymbolKind.Function,
+			action: async () => {}
+		});
+
+		(provider as any).fetchSymbols = async (query: string) => {
+			calls.push(query);
+			active++;
+			maxActive = Math.max(maxActive, active);
+			await new Promise<void>(resolve => releases.set(query, resolve));
+			active--;
+
+			return [createSymbol(query)];
+		};
+
+		const first = provider.search('first');
+		const discarded = provider.search('second');
+		const latest = provider.search('third');
+
+		assert.deepStrictEqual(await discarded, []);
+		releases.get('first')!();
+		await first;
+		await new Promise(resolve => setTimeout(resolve, 0));
+		releases.get('third')!();
+		assert.strictEqual((await latest)[0].label, 'third');
+		assert.deepStrictEqual(calls, ['first', 'third']);
+		assert.strictEqual(maxActive, 1);
+		assert.strictEqual((await provider.search('third'))[0].label, 'third');
+		assert.deepStrictEqual(calls, ['first', 'third'], 'expected the repeated query from cache');
+	});
+
+	test('Text provider discards a canceled search generation', async () => {
+		const provider = new TextSearchProvider();
+		const releases = new Map<string, (items: TextMatchItem[]) => void>();
+		const folder = vscode.workspace.workspaceFolders![0];
+		const createMatch = (label: string): TextMatchItem => ({
+			id: `text:${label}`,
+			type: SearchItemType.TextMatch,
+			label,
+			description: 'src/test.go',
+			detail: 'Line 1',
+			uri: vscode.Uri.joinPath(folder.uri, 'src', 'test.go'),
+			range: new vscode.Range(0, 0, 0, label.length),
+			lineText: label,
+			matchText: label,
+			action: async () => {}
+		});
+
+		(provider as any).searchFolder = async (_folder: vscode.WorkspaceFolder, query: string) =>
+			new Promise<TextMatchItem[]>(resolve => releases.set(query, resolve));
+
+		const first = provider.search('first');
+
+		await new Promise(resolve => setTimeout(resolve, 0));
+		const latest = provider.search('latest');
+
+		await new Promise(resolve => setTimeout(resolve, 0));
+		releases.get('first')!([createMatch('first')]);
+		assert.deepStrictEqual(await first, []);
+		releases.get('latest')!([createMatch('latest')]);
+		assert.strictEqual((await latest)[0].label, 'latest');
+	});
+
+	test('Text query cache is reused and invalidated after workspace changes', async () => {
+		const provider = new TextSearchProvider();
+		const folder = vscode.workspace.workspaceFolders![0];
+		const match: TextMatchItem = {
+			id: 'text:cached',
+			type: SearchItemType.TextMatch,
+			label: 'cached sent result',
+			description: 'src/test.go',
+			detail: 'Line 1',
+			uri: vscode.Uri.joinPath(folder.uri, 'src', 'test.go'),
+			range: new vscode.Range(0, 0, 0, 4),
+			lineText: 'cached sent result',
+			matchText: 'sent',
+			action: async () => {}
+		};
+		let searches = 0;
+
+		(provider as any).searchFolder = async () => {
+			searches++;
+
+			return [match];
+		};
+
+		await provider.search('sent');
+		await provider.search('sent');
+		assert.strictEqual(searches, 1);
+
+		provider.invalidateCache();
+		await provider.search('sent');
+		assert.strictEqual(searches, 2);
+	});
+
+	test('Persistent text index is loaded from disk and serves a new query without ripgrep', async () => {
+		const storageUri = vscode.Uri.file(path.join(os.tmpdir(), `search-everywhere-text-index-${Date.now()}`));
+
+		try {
+			const builder = new TextSearchProvider(storageUri, 1024 * 1024, 4 * 1024 * 1024);
+
+			await builder.refresh();
+
+			const provider = new TextSearchProvider(storageUri, 1024 * 1024, 4 * 1024 * 1024);
+			let ripgrepSearches = 0;
+
+			(provider as any).searchFolder = async () => {
+				ripgrepSearches++;
+
+				return [];
+			};
+
+			const loadedFiles = await provider.loadCache();
+			const results = await provider.search('SkipLevelLabel');
+
+			assert.ok(loadedFiles > 0, 'expected files loaded from the persisted text index');
+			assert.ok(results.some(item => item.label.includes('SkipLevelLabel')));
+			assert.strictEqual(ripgrepSearches, 0, 'expected a first-time query to use the memory index');
+		} finally {
+			await vscode.workspace.fs.delete(storageUri, { recursive: true, useTrash: false });
+		}
+	});
+
+	test('Search service reuses final ranked text results', async () => {
+		const searchService = new SearchService(context);
+		const provider = new TextSearchProvider();
+		const folder = vscode.workspace.workspaceFolders![0];
+		const match: TextMatchItem = {
+			id: 'text:ranked-cache',
+			type: SearchItemType.TextMatch,
+			label: 'ChallengeRoomPushEventSent = "sent"',
+			description: 'Model/ChallengeRoomPush.go',
+			detail: 'Line 41',
+			uri: vscode.Uri.joinPath(folder.uri, 'Model', 'ChallengeRoomPush.go'),
+			range: new vscode.Range(40, 0, 40, 4),
+			lineText: 'ChallengeRoomPushEventSent = "sent"',
+			matchText: 'sent',
+			action: async () => {}
+		};
+		let searches = 0;
+		let rankings = 0;
+		const originalRankResults = (searchService as any).rankResults.bind(searchService);
+
+		(provider as any).search = async () => {
+			searches++;
+
+			return [match];
+		};
+		(searchService as any).rankResults = (...args: unknown[]) => {
+			rankings++;
+
+			return originalRankResults(...args);
+		};
+		(searchService as any).providers.set('text', provider);
+
+		await searchService.searchText('sent');
+		await searchService.searchText('sent');
+		assert.strictEqual(searches, 1);
+		assert.strictEqual(rankings, 1);
+
+		(searchService as any).invalidateQueryCaches();
+		await searchService.searchText('sent');
+		assert.strictEqual(searches, 2);
+		assert.strictEqual(rankings, 2);
+	});
+
+	test('Short ASCII queries do not start a full-text workspace scan', async () => {
+		const searchService = new SearchService(context);
+		const provider = new TextSearchProvider();
+		let searches = 0;
+
+		(provider as any).search = async () => {
+			searches++;
+
+			return [];
+		};
+		(searchService as any).providers.set('text', provider);
+
+		assert.deepStrictEqual(await searchService.searchText('se'), []);
+		assert.strictEqual(searches, 0);
+	});
+
+	test('Global ranking computes each item score once', () => {
+		const searchService = new SearchService(context);
+		const items: FileSearchItem[] = Array.from({ length: 40 }, (_, index) => ({
+			id: `file:${index}`,
+			type: SearchItemType.File,
+			label: `sent-${index}.go`,
+			description: `src/sent-${index}.go`,
+			detail: `/tmp/src/sent-${index}.go`,
+			uri: vscode.Uri.file(`/tmp/src/sent-${index}.go`),
+			action: async () => {}
+		}));
+		const originalGetResultRank = (searchService as any).getResultRank.bind(searchService);
+		let rankCalls = 0;
+
+		(searchService as any).getResultRank = (item: SearchItem, query: unknown) => {
+			rankCalls++;
+
+			return originalGetResultRank(item, query);
+		};
+
+		searchService.mergeResults('sent', [items]);
+
+		assert.strictEqual(rankCalls, items.length);
 	});
 
 	test('Text search finds Skip Level matches in the fixture workspace', async () => {
@@ -126,6 +396,61 @@ suite('Extension Test Suite', () => {
 		assert.ok(results.every(item => !item.description.includes('tmp/go-build')), 'expected nested .gitignore files to exclude tmp/go-build');
 	});
 
+	test('Text provider scans beyond the display result limit', async () => {
+		const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+
+		assert.ok(workspaceFolder, 'expected the test workspace to be open');
+
+		const fixtureDirectory = vscode.Uri.joinPath(workspaceFolder!.uri, 'late-text-match-regression');
+		const token = 'late_text_match_regression_token';
+
+		await vscode.workspace.fs.createDirectory(fixtureDirectory);
+
+		try {
+			for (let index = 0; index < 10; index++) {
+				const uri = vscode.Uri.joinPath(fixtureDirectory, `noise-${index}.txt`);
+				const contents = Buffer.from(`${token}\n${token}\n${token}\nAdsEntryAny\nAdsEntryAny\nAdsEntryAny\n`, 'utf8');
+
+				await vscode.workspace.fs.writeFile(uri, contents);
+			}
+
+			const targetUri = vscode.Uri.joinPath(fixtureDirectory, 'target.go');
+
+			await vscode.workspace.fs.writeFile(
+				targetUri,
+				Buffer.from('const ChallengeRoomPushEventSent = "sent"\n', 'utf8')
+			);
+
+			const provider = new TextSearchProvider();
+			const results = await provider.search(token);
+
+			assert.ok(results.length > 20, 'expected scanning to continue beyond maxTextResults');
+
+			const searchService = new SearchService(context);
+			const rankedResults = await searchService.searchText('sent');
+
+			assert.ok(
+				rankedResults.some(item =>
+					item.type === SearchItemType.TextMatch &&
+					(item as TextMatchItem).uri.toString() === targetUri.toString()
+				),
+				'expected an exact identifier segment after noisy substring matches'
+			);
+
+			const quotedResults = await searchService.searchText('"sent"');
+
+			assert.ok(
+				quotedResults.some(item =>
+					item.type === SearchItemType.TextMatch &&
+					(item as TextMatchItem).uri.toString() === targetUri.toString()
+				),
+				'expected quoted search to find the exact string literal'
+			);
+		} finally {
+			await vscode.workspace.fs.delete(fixtureDirectory, { recursive: true });
+		}
+	});
+
 	test('Text match quick pick items are always shown', async () => {
 		const searchService = new SearchService(context);
 		const results = await searchService.searchText('skip lev');
@@ -137,6 +462,7 @@ suite('Extension Test Suite', () => {
 		const quickPickItem = (searchUi as any).createQuickPickItem(textMatch);
 
 		assert.strictEqual(quickPickItem.alwaysShow, true);
+		assert.strictEqual(quickPickItem.detail, undefined, 'expected stable single-line quick pick rows');
 	});
 
 	test('Search UI keeps text results in quick pick items', async () => {
@@ -154,12 +480,136 @@ suite('Extension Test Suite', () => {
 		assert.ok(visibleItems.some(item => (item.label || '').toLowerCase().includes('skip level')));
 	});
 
-	test('Search UI performSearch shows Skip Level results in All filter', async () => {
+	test('All mode globally ranks exact text above weak file matches without type sections', async () => {
 		const searchService = new SearchService(context);
+		const uri = vscode.Uri.file('/tmp/ChallengeRoomPush.go');
+		const range = new vscode.Range(new vscode.Position(40, 0), new vscode.Position(40, 4));
+		const textMatch: TextMatchItem = {
+			id: 'text:sent',
+			type: SearchItemType.TextMatch,
+			label: 'ChallengeRoomPushEventSent = "sent"',
+			description: 'Model/ChallengeRoomPush.go',
+			detail: 'Line 41',
+			uri,
+			range,
+			lineText: 'ChallengeRoomPushEventSent = "sent"',
+			matchText: 'sent',
+			priority: 4030,
+			action: async () => {}
+		};
+
+		const fileItem: FileSearchItem = {
+			id: 'file:test',
+			type: SearchItemType.File,
+			label: 'click_sta_client_version_test.go',
+			description: 'Admin/click_sta_client_version_test.go',
+			detail: 'Admin/click_sta_client_version_test.go',
+			uri,
+			action: async () => {}
+		};
+		const rankedItems = searchService.mergeResults('sent', [[fileItem], [textMatch]]);
+
+		assert.strictEqual(rankedItems[0].id, textMatch.id, 'expected exact text to outrank a weak file subsequence');
+
 		const searchUi = new SearchUI(searchService, context);
 
 		(searchUi as any).activeFilter = FilterCategory.All;
+		(searchUi as any).lastQuery = 'sent';
+		(searchUi as any).updateSearchItems(rankedItems);
+
+		const quickPickItems = ((searchUi as any).quickPick as vscode.QuickPick<vscode.QuickPickItem>).items;
+
+		assert.ok(quickPickItems.every(item => item.kind !== vscode.QuickPickItemKind.Separator));
+		assert.ok(quickPickItems[0].label.includes('ChallengeRoomPushEventSent'));
+	});
+
+	test('Symbol search drops loose subsequences and keeps direct name matches', async () => {
+		const searchService = new SearchService(context);
+		const uri = vscode.Uri.file('/tmp/Model/ChallengeRoomPush.go');
+		const range = new vscode.Range(new vscode.Position(40, 0), new vscode.Position(40, 26));
+		const createSymbol = (label: string): SymbolSearchItem => ({
+			id: `symbol:${label}`,
+			type: SearchItemType.Symbol,
+			label,
+			description: 'Function',
+			detail: uri.fsPath,
+			uri,
+			range,
+			symbolKind: vscode.SymbolKind.Function,
+			priority: 90,
+			action: async () => {}
+		});
+
+		(searchService as any).providers.set('symbols', {
+			search: async () => [
+				createSymbol('ChallengeRoomPushEventSent'),
+				createSymbol('WaterSortClient')
+			]
+		});
+
+		const results = await searchService.searchSymbols('"sent"');
+
+		assert.ok(results.some(item => item.label === 'ChallengeRoomPushEventSent'));
+		assert.ok(results.every(item => item.label !== 'WaterSortClient'));
+	});
+
+	test('Symbol rows show a concise location and a kind-specific icon', () => {
+		const searchService = new SearchService(context);
+		const searchUi = new SearchUI(searchService, context);
+		const uri = vscode.Uri.joinPath(vscode.workspace.workspaceFolders![0].uri, 'Model', 'ChallengeRoomPush.go');
+		const range = new vscode.Range(new vscode.Position(40, 0), new vscode.Position(40, 26));
+		const symbol: SymbolSearchItem = {
+			id: 'symbol:ChallengeRoomPushEventSent',
+			type: SearchItemType.Symbol,
+			label: 'ChallengeRoomPushEventSent',
+			description: 'Constant - v12w.x34y.com/dolphin/BrainGameServer/Model',
+			detail: uri.fsPath,
+			uri,
+			range,
+			symbolKind: vscode.SymbolKind.Constant,
+			priority: 100,
+			action: async () => {}
+		};
+		const item = (searchUi as any).createQuickPickItem(symbol) as vscode.QuickPickItem;
+
+		assert.strictEqual(item.description, 'Model/ChallengeRoomPush.go:41');
+		assert.strictEqual((item.iconPath as vscode.ThemeIcon).id, 'symbol-constant');
+		assert.strictEqual(item.detail, undefined);
+	});
+
+	test('Quick pick rows sanitize localized objects to strings', () => {
+		const searchService = new SearchService(context);
+		const searchUi = new SearchUI(searchService, context);
+		const malformedItem = {
+			id: 'command:localized',
+			type: SearchItemType.Command,
+			label: { value: 'Localized Action' },
+			description: { value: 'Actions' },
+			detail: 'localized.action',
+			command: 'localized.action',
+			action: async () => {}
+		} as unknown as SearchItem;
+		const item = (searchUi as any).createQuickPickItem(malformedItem) as vscode.QuickPickItem;
+
+		assert.strictEqual(item.label, 'Localized Action');
+		assert.strictEqual(item.description, 'Actions');
+	});
+
+	test('Search UI performSearch shows Skip Level results in All filter', async () => {
+		const searchService = new SearchService(context);
+		const searchUi = new SearchUI(searchService, context);
+		const originalUpdateSearchItems = (searchUi as any).updateSearchItems.bind(searchUi);
+		let renderCount = 0;
+		const renderedBatches: SearchItem[][] = [];
+
+		(searchUi as any).activeFilter = FilterCategory.All;
 		(searchUi as any).lastQuery = 'skip lev';
+		(searchUi as any).isVisible = true;
+		(searchUi as any).updateSearchItems = (items: SearchItem[]) => {
+			renderCount++;
+			renderedBatches.push(items);
+			originalUpdateSearchItems(items);
+		};
 
 		await (searchUi as any).performSearch('skip lev');
 
@@ -170,6 +620,61 @@ suite('Extension Test Suite', () => {
 		assert.ok(visibleItems.some(item =>
 			`${item.label} ${item.description || ''} ${item.detail || ''}`.toLowerCase().includes('skip level')
 		));
+		assert.ok(renderCount >= 1 && renderCount <= 2, `expected at most two stable renders, got ${renderCount}`);
+
+		if (renderedBatches.length === 2) {
+			assert.ok(
+				renderedBatches[0].every(item => item.type === SearchItemType.File || item.type === SearchItemType.Command),
+				'expected the persisted file/action index in the fast first render'
+			);
+		}
+	});
+
+	test('Hidden quick pick cannot be repopulated by a completed stale search', async () => {
+		const searchService = new SearchService(context);
+		const searchUi = new SearchUI(searchService, context);
+		const quickPick = (searchUi as any).quickPick as vscode.QuickPick<vscode.QuickPickItem>;
+		let resolveIndexed!: (items: SearchItem[]) => void;
+		const indexed = new Promise<SearchItem[]>(resolve => {
+			resolveIndexed = resolve;
+		});
+
+		(searchService as any).searchIndexed = async () => indexed;
+		(searchService as any).searchSymbols = async () => [];
+		(searchService as any).searchText = async () => [];
+		(searchUi as any).activeFilter = FilterCategory.All;
+		(searchUi as any).lastQuery = 'sent';
+		(searchUi as any).isVisible = true;
+
+		const pendingSearch = (searchUi as any).performSearch('sent');
+
+		(searchUi as any).onDidHide();
+		resolveIndexed([{
+			id: 'file:stale',
+			type: SearchItemType.File,
+			label: 'stale.go',
+			description: 'stale.go',
+			detail: '/tmp/stale.go',
+			uri: vscode.Uri.file('/tmp/stale.go'),
+			action: async () => {}
+		} as FileSearchItem]);
+		await pendingSearch;
+
+		assert.strictEqual(quickPick.items.length, 0);
+		clearTimeout((searchService as any).backgroundRefreshTimer);
+	});
+
+	test('Changing a query clears old rows before the next search renders', () => {
+		const searchService = new SearchService(context);
+		const searchUi = new SearchUI(searchService, context);
+		const quickPick = (searchUi as any).quickPick as vscode.QuickPick<vscode.QuickPickItem>;
+
+		(searchUi as any).lastQuery = 'sent';
+		quickPick.items = [{ label: 'old result' }];
+		(searchUi as any).onDidChangeValue('');
+
+		assert.strictEqual(quickPick.items.length, 0);
+		clearTimeout((searchUi as any).searchDebounce);
 	});
 
 	test('File path queries with :line jump to the requested line', async () => {

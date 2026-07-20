@@ -49,13 +49,13 @@ export class FuzzysortAdapter implements FuzzySearcher {
 function scoreItem(item: SearchItem, query: string): number {
     const label = normalize(item.label);
     const pathText = normalize(`${item.description || ''}`);
-    let score = scoreText(label, query, 10000);
+    let matchScore = scoreText(label, query, 10000);
 
     if (pathText) {
-        score = Math.max(score, scoreText(pathText, query, 6500));
+        matchScore = Math.max(matchScore, scoreText(pathText, query, 6500));
     }
 
-    return score + (item.priority || 0);
+    return matchScore > 0 ? matchScore + (item.priority || 0) : 0;
 }
 
 function scoreText(text: string, query: string, base: number): number {

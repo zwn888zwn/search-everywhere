@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import { SearchItem, SearchItemType } from '../core/types';
 import { SearchService } from '../core/search-service';
+import { parseSearchQuery } from '../core/search-query';
 import { getConfiguration } from '../utils/config';
 
 /**
@@ -20,15 +21,13 @@ export enum FilterCategory {
  */
 export class SearchUI {
     private static readonly LAST_QUERY_KEY = 'searchEverywhere.lastQuery';
-    private static readonly TEXT_FALLBACK_MIN_QUERY_LENGTH = 3;
-    private static readonly TEXT_FALLBACK_RESULT_THRESHOLD = 12;
-
     private quickPick: vscode.QuickPick<SearchQuickPickItem>;
     private searchDebounce: NodeJS.Timeout | undefined;
     private lastQuery: string = '';
     private config = getConfiguration();
     private previewDisposables: vscode.Disposable[] = [];
     private searchGeneration = 0;
+    private isVisible = false;
 
     // Active filter category
     private activeFilter: FilterCategory = FilterCategory.All;
@@ -49,6 +48,7 @@ export class SearchUI {
         this.quickPick.placeholder = 'Type to search everywhere (files, classes, symbols...)';
         this.quickPick.matchOnDescription = true;
         this.quickPick.matchOnDetail = true;
+        this.quickPick.keepScrollPosition = false;
         (this.quickPick as vscode.QuickPick<SearchQuickPickItem> & { sortByLabel: boolean }).sortByLabel = false;
         this.quickPick.ignoreFocusOut = false;
 
@@ -226,6 +226,8 @@ export class SearchUI {
                     clearTimeout(this.searchDebounce);
                 }
 
+                this.searchService.cancelPendingSearches();
+
                 // Update title to show active filter
                 this.updateTitle();
 
@@ -256,13 +258,27 @@ export class SearchUI {
      * Show the search dialog
      */
     public show(): void {
+        if (this.searchDebounce) {
+            clearTimeout(this.searchDebounce);
+            this.searchDebounce = undefined;
+        }
+
+        this.searchService.cancelPendingSearches();
+        this.searchGeneration++;
+        this.isVisible = true;
+
         // Always reset to "All" filter when opening
         this.activeFilter = FilterCategory.All;
 
         const initialQuery = this.context.workspaceState.get<string>(SearchUI.LAST_QUERY_KEY, '');
 
-        this.quickPick.value = initialQuery;
         this.lastQuery = initialQuery;
+        this.quickPick.busy = false;
+        this.quickPick.keepScrollPosition = false;
+        this.quickPick.activeItems = [];
+        this.quickPick.selectedItems = [];
+        this.quickPick.items = [];
+        this.quickPick.value = initialQuery;
 
         // Refresh configuration
         this.config = getConfiguration();
@@ -277,6 +293,10 @@ export class SearchUI {
         this.quickPick.show();
 
         setTimeout(() => {
+            if (!this.isVisible) {
+                return;
+            }
+
             this.searchService.startIndexing();
             this.performSearch(initialQuery);
         }, 0);
@@ -298,6 +318,12 @@ export class SearchUI {
 
         this.lastQuery = value;
         this.saveLastQuery(value);
+        this.searchService.cancelPendingSearches();
+
+        // Clear the previous virtualized rows before the next contributor batch
+        // arrives. Replacing mixed result shapes in place can leave stale rows
+        // painted by VS Code when a query is quickly deleted or replaced.
+        this.quickPick.items = [];
 
         // Show "Searching..." when query changes
         this.quickPick.busy = true;
@@ -305,7 +331,7 @@ export class SearchUI {
         // Debounce to avoid excessive searches while typing
         this.searchDebounce = setTimeout(() => {
             this.performSearch(value);
-        }, 50); // Very short delay for responsiveness
+        }, 150);
     }
 
     /**
@@ -319,156 +345,112 @@ export class SearchUI {
             this.quickPick.busy = true;
 
             if (!query.trim()) {
-                this.updateSearchItems(await this.searchService.getDefaultItems());
+                const defaultItems = await this.searchService.getDefaultItems();
+
+                if (this.isCurrentSearch(query, generation, searchFilter)) {
+                    this.updateSearchItems(defaultItems);
+                }
 
                 return;
             }
 
             if (searchFilter === FilterCategory.All) {
-                const isFunctionQuery = this.isFunctionNameQuery(query);
-                const primaryResultsPromise = this.searchService.search(query, {
-                    includeText: false,
-                    includeFunctions: false
+                const indexedPromise = this.searchService.searchIndexed(query);
+                let slowContributorsSettled = false;
+                const slowContributorsPromise = Promise.all([
+                    this.searchService.searchSymbols(query),
+                    this.searchService.searchText(query)
+                ]).then(results => {
+                    slowContributorsSettled = true;
+
+                    return results;
                 });
-                const textResultsPromise = this.searchService.searchText(query);
-                const functionResultsPromise = isFunctionQuery
-                    ? this.searchService.searchFunctionNames(query)
-                    : Promise.resolve([]);
+                const indexedResults = await indexedPromise;
 
-                let quickResults: SearchItem[] = [];
-                let textResults: SearchItem[] = [];
-
-                if (isFunctionQuery) {
-                    const functionResults = await functionResultsPromise;
-
-                    if (!this.isCurrentSearch(query, generation, FilterCategory.All)) {
-                        return;
-                    }
-
-                    quickResults = functionResults;
-
-                    if (quickResults.length > 0) {
-                        this.updateSearchItems(quickResults);
-                        this.quickPick.busy = false;
-                    }
-                } else {
-                    textResults = await textResultsPromise;
-
-                    if (!this.isCurrentSearch(query, generation, FilterCategory.All)) {
-                        return;
-                    }
-
-                    quickResults = textResults;
-
-                    if (quickResults.length > 0) {
-                        this.updateSearchItems(quickResults);
-                        this.quickPick.busy = false;
-                    }
-                }
-
-                const primaryResults = await primaryResultsPromise;
-
-                if (!this.isCurrentSearch(query, generation, FilterCategory.All)) {
+                if (!this.isCurrentSearch(query, generation, searchFilter)) {
                     return;
                 }
 
-                quickResults = this.mergeSearchResults(primaryResults, quickResults);
-
-                if (quickResults.length > 0) {
-                    this.updateSearchItems(quickResults);
-                    this.quickPick.busy = false;
+                // Files, directories and actions come from the persisted index
+                // and should feel instant. Skip this intermediate render when
+                // cached slow contributors have already completed.
+                if (indexedResults.length > 0 && !slowContributorsSettled) {
+                    this.updateSearchItems(indexedResults);
                 }
 
-                if (isFunctionQuery) {
-                    textResults = await textResultsPromise;
+                const slowResults = await slowContributorsPromise;
 
-                    if (!this.isCurrentSearch(query, generation, FilterCategory.All)) {
-                        return;
-                    }
-
-                    if (textResults.length > 0) {
-                        this.updateSearchItems(this.mergeSearchResults(quickResults, textResults));
-                    }
+                if (!this.isCurrentSearch(query, generation, searchFilter)) {
+                    return;
                 }
+
+                this.updateSearchItems(this.searchService.mergeResults(query, [indexedResults, ...slowResults]));
 
                 return;
             }
 
-            const results = query.trim()
-                ? await this.searchService.search(query, {
-                    includeText: searchFilter === FilterCategory.Text,
-                    textOnly: searchFilter === FilterCategory.Text
-                })
-                : await this.searchService.getDefaultItems();
+            const contributors = this.getContributorSearches(query, searchFilter);
+            const resultSets = await Promise.all(contributors);
 
             if (!this.isCurrentSearch(query, generation, searchFilter)) {
                 return;
             }
 
-            this.updateSearchItems(results);
+            this.updateSearchItems(this.searchService.mergeResults(query, resultSets));
 
         } catch (error) {
             console.error('Error performing search:', error);
             this.quickPick.placeholder = 'Error performing search';
         } finally {
-            this.quickPick.busy = false;
-        }
-    }
-
-    private shouldAppendTextFallback(query: string, primaryResults: SearchItem[]): boolean {
-        if (primaryResults.length === 0) {
-            return true;
-        }
-
-        return query.trim().length >= SearchUI.TEXT_FALLBACK_MIN_QUERY_LENGTH &&
-            primaryResults.length < SearchUI.TEXT_FALLBACK_RESULT_THRESHOLD;
-    }
-
-    private async appendTextResults(query: string, primaryResults: SearchItem[], generation: number): Promise<void> {
-        try {
-            const textResults = await this.searchService.searchText(query);
-
-            if (!this.isCurrentSearch(query, generation, FilterCategory.All) || textResults.length === 0) {
-                return;
+            if (this.isCurrentSearch(query, generation, searchFilter)) {
+                this.quickPick.busy = false;
             }
+        }
+    }
 
-            this.updateSearchItems(this.mergeSearchResults(primaryResults, textResults));
-        } catch (error) {
-            console.error('Error appending text search results:', error);
+    private getContributorSearches(query: string, filter: FilterCategory): Array<Promise<SearchItem[]>> {
+        switch (filter) {
+            case FilterCategory.Classes:
+                return [this.searchService.searchSymbols(query, [SearchItemType.Class])];
+
+            case FilterCategory.Files:
+                return [this.searchService.searchIndexed(query, [SearchItemType.File])];
+
+            case FilterCategory.Symbols:
+                return [this.searchService.searchSymbols(query, [SearchItemType.Symbol])];
+
+            case FilterCategory.Actions:
+                return [this.searchService.searchIndexed(query, [SearchItemType.Command])];
+
+            case FilterCategory.Text:
+                return [this.searchService.searchText(query)];
+
+            case FilterCategory.All:
+
+            default:
+                return [
+                    this.searchService.searchIndexed(query),
+                    this.searchService.searchSymbols(query),
+                    this.searchService.searchText(query)
+                ];
         }
     }
 
     private isCurrentSearch(query: string, generation: number, filter: FilterCategory): boolean {
-        return generation === this.searchGeneration &&
+        return this.isVisible &&
+            generation === this.searchGeneration &&
             query === this.lastQuery &&
             this.activeFilter === filter;
-    }
-
-    private mergeSearchResults(primaryResults: SearchItem[], textResults: SearchItem[]): SearchItem[] {
-        const seen = new Set<string>();
-        const merged: SearchItem[] = [];
-
-        for (const item of [...primaryResults, ...textResults]) {
-            if (seen.has(item.id)) {
-                continue;
-            }
-
-            seen.add(item.id);
-            merged.push(item);
-        }
-
-        return merged;
-    }
-
-    private isFunctionNameQuery(query: string): boolean {
-        return /^[A-Za-z0-9_$]+$/.test(query.trim());
     }
 
     private updateSearchItems(results: SearchItem[]): void {
         const filteredResults = this.applyCategoryFilter(results);
         const items = filteredResults.map(item => this.createQuickPickItem(item));
 
-        this.quickPick.items = this.groupItemsByType(items);
+        this.quickPick.keepScrollPosition = false;
+        this.quickPick.activeItems = [];
+        this.quickPick.selectedItems = [];
+        this.quickPick.items = items;
     }
 
     private saveLastQuery(value: string): void {
@@ -542,12 +524,21 @@ export class SearchUI {
      * Handle user closing the dialog
      */
     private onDidHide(): void {
+        this.isVisible = false;
+        this.searchGeneration++;
+
         // Clear any scheduled search
         if (this.searchDebounce) {
             clearTimeout(this.searchDebounce);
+            this.searchDebounce = undefined;
         }
 
+        this.searchService.cancelPendingSearches();
+
         // Clear quick pick items to free memory
+        this.quickPick.busy = false;
+        this.quickPick.activeItems = [];
+        this.quickPick.selectedItems = [];
         this.quickPick.items = [];
 
         // Dispose of any preview disposables
@@ -642,9 +633,8 @@ export class SearchUI {
      * Convert a SearchItem to a QuickPickItem
      */
     private createQuickPickItem(item: SearchItem): SearchQuickPickItem {
-        let label = this.formatLabel(item);
-        let description = item.description || '';
-        let detail = '';
+        const label = this.formatLabel(item);
+        let description = this.toQuickPickText(item.description);
 
         if ('uri' in item && item.uri instanceof vscode.Uri) {
             const workspaceFolder = vscode.workspace.getWorkspaceFolder(item.uri);
@@ -658,35 +648,75 @@ export class SearchUI {
 
                     description = `${description}:${lineNumber}`;
                 }
-
-                if (item.type === SearchItemType.Symbol || item.type === SearchItemType.Class) {
-                    detail = item.description || '';
-                }
             }
-        } else {
-            // For non-file items, keep the original detail
-            detail = item.detail || '';
         }
 
         return {
             label: label,
             description: description,
-            detail: detail,
             alwaysShow: true,
-            iconPath: item.iconPath instanceof vscode.ThemeIcon ? item.iconPath : undefined,
+            iconPath: this.getResultIcon(item),
             originalItem: item,
             type: item.type
         };
     }
 
+    private getResultIcon(item: SearchItem): vscode.ThemeIcon | undefined {
+        if ((item.type === SearchItemType.Symbol || item.type === SearchItemType.Class) && 'symbolKind' in item) {
+            return new vscode.ThemeIcon(this.getSymbolIconId(item.symbolKind as vscode.SymbolKind));
+        }
+
+        return item.iconPath instanceof vscode.ThemeIcon ? item.iconPath : undefined;
+    }
+
+    private getSymbolIconId(kind: vscode.SymbolKind): string {
+        switch (kind) {
+            case vscode.SymbolKind.Class:
+                return 'symbol-class';
+
+            case vscode.SymbolKind.Interface:
+                return 'symbol-interface';
+
+            case vscode.SymbolKind.Struct:
+                return 'symbol-struct';
+
+            case vscode.SymbolKind.Enum:
+                return 'symbol-enum';
+
+            case vscode.SymbolKind.Method:
+                return 'symbol-method';
+
+            case vscode.SymbolKind.Function:
+                return 'symbol-function';
+
+            case vscode.SymbolKind.Constructor:
+                return 'symbol-constructor';
+
+            case vscode.SymbolKind.Constant:
+                return 'symbol-constant';
+
+            case vscode.SymbolKind.Field:
+                return 'symbol-field';
+
+            case vscode.SymbolKind.Property:
+                return 'symbol-property';
+
+            case vscode.SymbolKind.Variable:
+                return 'symbol-variable';
+
+            default:
+                return 'symbol-misc';
+        }
+    }
+
     private formatLabel(item: SearchItem): string {
         if (item.type !== SearchItemType.TextMatch) {
-            return item.label;
+            return this.toQuickPickText(item.label);
         }
 
         const textItem = item as SearchItem & { lineText?: string };
-        const lineText = (textItem.lineText || item.label).trim();
-        const query = this.lastQuery.trim();
+        const lineText = this.toQuickPickText(textItem.lineText || item.label).trim();
+        const query = parseSearchQuery(this.lastQuery).term;
 
         if (!query) {
             return this.truncateMiddle(lineText, 120);
@@ -708,6 +738,32 @@ export class SearchUI {
         return `${prefix}${lineText.substring(start, end)}${suffix}`;
     }
 
+    private toQuickPickText(value: unknown): string {
+        if (typeof value === 'string') {
+            return value;
+        }
+
+        if (typeof value === 'number' || typeof value === 'boolean') {
+            return String(value);
+        }
+
+        if (value && typeof value === 'object') {
+            const localizedValue = (value as { value?: unknown }).value;
+
+            if (typeof localizedValue === 'string') {
+                return localizedValue;
+            }
+
+            const label = (value as { label?: unknown }).label;
+
+            if (typeof label === 'string') {
+                return label;
+            }
+        }
+
+        return '';
+    }
+
     private truncateMiddle(text: string, maxLength: number): string {
         if (text.length <= maxLength) {
             return text;
@@ -718,89 +774,6 @@ export class SearchUI {
         return `${text.substring(0, half)}...${text.substring(text.length - half)}`;
     }
 
-    /**
-     * Group items by type for better organization
-     */
-    private groupItemsByType(items: SearchQuickPickItem[]): SearchQuickPickItem[] {
-        const groupedItems: SearchQuickPickItem[] = [];
-
-        // Group items by type
-        const itemsByType = new Map<SearchItemType, SearchQuickPickItem[]>();
-
-        for (const item of items) {
-            if (!itemsByType.has(item.type)) {
-                itemsByType.set(item.type, []);
-            }
-            itemsByType.get(item.type)!.push(item);
-        }
-
-        // Define the order of types for display
-        const typeOrder: SearchItemType[] = [
-            SearchItemType.Class,
-            SearchItemType.File,
-            SearchItemType.Symbol,
-            SearchItemType.Command,
-            SearchItemType.TextMatch
-        ];
-
-        // Add section headers and items in the defined order
-        for (const type of typeOrder) {
-            const typeItems = itemsByType.get(type);
-
-            // Skip empty sections
-            if (!typeItems || typeItems.length === 0) {
-                continue;
-            }
-
-            // Create a more visually distinct header for the active filter's section
-            const typeName = this.getTypeName(type);
-            const isActiveFilterSection =
-                (this.activeFilter === FilterCategory.Classes && type === SearchItemType.Class) ||
-                (this.activeFilter === FilterCategory.Files && type === SearchItemType.File) ||
-                (this.activeFilter === FilterCategory.Symbols && type === SearchItemType.Symbol) ||
-                (this.activeFilter === FilterCategory.Actions && type === SearchItemType.Command) ||
-                (this.activeFilter === FilterCategory.Text && type === SearchItemType.TextMatch);
-
-            const headerPrefix = isActiveFilterSection ? '▶ ' : '';
-
-            // Add section header with enhanced visual distinction for active filter
-            groupedItems.push({
-                label: `${headerPrefix}${typeName} (${typeItems.length})`,
-                kind: vscode.QuickPickItemKind.Separator,
-                type: type
-            });
-
-            // Add items
-            groupedItems.push(...typeItems);
-        }
-
-        return groupedItems;
-    }
-
-    /**
-     * Get a user-friendly name for a search item type
-     */
-    private getTypeName(type: SearchItemType): string {
-        switch (type) {
-            case SearchItemType.File:
-                return 'Files';
-
-            case SearchItemType.Symbol:
-                return 'Symbols';
-
-            case SearchItemType.Class:
-                return 'Classes';
-
-            case SearchItemType.Command:
-                return 'Actions';
-
-            case SearchItemType.TextMatch:
-                return 'Text Matches';
-
-            default:
-                return 'Items';
-        }
-    }
 }
 
 /**

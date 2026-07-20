@@ -1,34 +1,18 @@
 import * as vscode from 'vscode';
-import { spawn } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as readline from 'readline';
 import { CommandSearchItem, FileSearchItem, FuzzySearcher, SearchEverywhereConfig, SearchItem, SearchItemType, SearchProvider, SymbolKindGroup, SymbolSearchItem, TextMatchItem } from './types';
 import { FileSearchProvider } from '../providers/file-provider';
 import { CommandSearchProvider } from '../providers/command-provider';
-import { DocumentSymbolProvider } from '../providers/document-symbol-provider';
+import { SymbolSearchProvider } from '../providers/symbol-provider';
 import { TextSearchProvider } from '../providers/text-provider';
+import { parseSearchQuery, ParsedSearchQuery } from './search-query';
 import { getConfiguration } from '../utils/config';
 import { SearchFactory } from '../search/search-factory';
 import { Debouncer } from '../utils/debouncer';
 import { isWorkspaceFile } from '../utils/workspace';
 import { ExclusionPatterns } from '../utils/exclusions';
-
-interface RgMatch {
-    type: string;
-    data?: {
-        path?: { text?: string };
-        lines?: { text?: string };
-        line_number?: number;
-    };
-}
-
-interface ParsedFunction {
-    name: string;
-    offset: number;
-    container?: string;
-    isMethod: boolean;
-}
 
 interface FileLocationQuery {
     pathQuery: string;
@@ -36,12 +20,19 @@ interface FileLocationQuery {
     column?: number;
 }
 
+interface SearchOptions {
+    includeText?: boolean;
+    includeSymbols?: boolean;
+    types?: SearchItemType[];
+}
+
 /**
  * Main service for coordinating search functionality
  */
 export class SearchService {
-    private static readonly CACHE_VERSION = 9;
+    private static readonly CACHE_VERSION = 10;
     private static readonly MAX_CACHE_LOAD_BYTES = 64 * 1024 * 1024;
+    private static readonly MAX_QUERY_CACHE_ENTRIES = 30;
 
     private providers: Map<string, SearchProvider> = new Map();
     private searcher: FuzzySearcher;
@@ -57,7 +48,9 @@ export class SearchService {
     private backgroundRefreshRequestPromise: Promise<void> | undefined;
     private resolveBackgroundRefreshRequest: (() => void) | undefined;
     private backgroundRefreshRequested = false;
-    private hasBuiltIndex = false;
+    private indexedResultCache = new Map<string, SearchItem[]>();
+    private symbolResultCache = new Map<string, SearchItem[]>();
+    private textResultCache = new Map<string, SearchItem[]>();
 
     /**
      * Initialize the search service
@@ -81,6 +74,7 @@ export class SearchService {
         // Listen for configuration changes
         vscode.workspace.onDidChangeConfiguration(e => {
             if (e.affectsConfiguration('searchEverywhere')) {
+                this.invalidateQueryCaches();
                 this.config = getConfiguration();
 
                 // Update searcher if library changed
@@ -190,6 +184,26 @@ export class SearchService {
         // Watch for file saves - the providers will refresh internally, we need to collect their results
         vscode.workspace.onDidSaveTextDocument(() => {
             console.log('File saved, scheduling index update...');
+            this.invalidateQueryCaches();
+            this.invalidateTextIndex();
+            this.scheduleIndexUpdate();
+        });
+
+        vscode.workspace.onDidCreateFiles(() => {
+            this.invalidateQueryCaches();
+            this.invalidateTextIndex();
+            this.scheduleIndexUpdate();
+        });
+
+        vscode.workspace.onDidDeleteFiles(() => {
+            this.invalidateQueryCaches();
+            this.invalidateTextIndex();
+            this.scheduleIndexUpdate();
+        });
+
+        vscode.workspace.onDidRenameFiles(() => {
+            this.invalidateQueryCaches();
+            this.invalidateTextIndex();
             this.scheduleIndexUpdate();
         });
 
@@ -222,7 +236,7 @@ export class SearchService {
         }
 
         // Collect only providers that are cheap and deterministic after edits.
-        // Symbols are found on demand; pulling docSymbols here can silently run
+        // Symbols are found on demand; pulling them here can silently run
         // a workspace scan after the progress notification has already closed.
         const providerEntries = [...this.providers.entries()]
             .filter(([name]) => name === 'files' || name === 'commands');
@@ -252,7 +266,9 @@ export class SearchService {
 
         // Update the allItems array with the latest items
         this.allItems = Array.from(deduplicationMap.values());
+        this.indexedResultCache.clear();
         void this.saveIndexCache();
+        void (this.providers.get('text') as TextSearchProvider | undefined)?.refresh();
 
         console.log(`Index update completed: ${this.allItems.length} items (after deduplication)`);
     }
@@ -318,9 +334,9 @@ export class SearchService {
             this.providers.set('files', new FileSearchProvider());
         }
 
-        // Add symbol providers
+        // Symbols are contributed on demand by the active language servers.
         if (this.config.indexing.includeSymbols) {
-            this.providers.set('docSymbols', new DocumentSymbolProvider());
+            this.providers.set('symbols', new SymbolSearchProvider());
         }
 
         // Add command provider
@@ -330,7 +346,11 @@ export class SearchService {
 
         // Add text search provider
         if (this.config.indexing.includeText) {
-            this.providers.set('text', new TextSearchProvider());
+            this.providers.set('text', new TextSearchProvider(
+                this.getStorageUri(),
+                this.config.performance.maxTextFileSizeBytes,
+                this.config.performance.maxTextIndexBytes
+            ));
         }
     }
 
@@ -363,6 +383,7 @@ export class SearchService {
     ): Promise<void> {
         // Refresh providers based on configuration only when the provider set may have changed.
         if (recreateProviders) {
+            this.invalidateQueryCaches();
             this.providers.clear();
             this.registerProviders();
         }
@@ -378,7 +399,7 @@ export class SearchService {
 
         // Collect items from all providers
         const providerEntries = [...this.providers.entries()]
-            .filter(([name]) => force || name !== 'docSymbols');
+            .filter(([name]) => name !== 'symbols');
 
         providerEntries.sort(([leftName], [rightName]) => this.getProviderRefreshOrder(leftName) - this.getProviderRefreshOrder(rightName));
 
@@ -428,7 +449,7 @@ export class SearchService {
 
         // Convert the deduplication map to the array
         this.allItems = Array.from(deduplicationMap.values());
-        this.hasBuiltIndex = true;
+        this.indexedResultCache.clear();
         progress?.report({ message: `Writing index cache (${this.allItems.length} items)...`, increment: 10 });
         await this.saveIndexCache();
 
@@ -446,7 +467,7 @@ export class SearchService {
             case 'text':
                 return 2;
 
-            case 'docSymbols':
+            case 'symbols':
                 return 3;
 
             default:
@@ -462,7 +483,7 @@ export class SearchService {
             case SearchItemType.Symbol:
 
             case SearchItemType.Class:
-                return 'docSymbols';
+                return 'symbols';
 
             case SearchItemType.Command:
                 return 'commands';
@@ -505,273 +526,6 @@ export class SearchService {
         } catch (error) {
             console.error('Error building initial file index:', error);
         }
-    }
-
-    private async findFunctionCandidatesInFolder(folder: vscode.WorkspaceFolder, query: string, limit: number): Promise<SymbolSearchItem[]> {
-        return new Promise(resolve => {
-            const results: SymbolSearchItem[] = [];
-            const args = this.buildFunctionQueryRgArgs(folder, query);
-            const child = spawn(this.getRgCommand(), args, {
-                cwd: folder.uri.fsPath,
-                windowsHide: true
-            });
-            let buffer = '';
-
-            child.stdout.setEncoding('utf8');
-            child.stdout.on('data', chunk => {
-                buffer += chunk;
-                buffer = this.processFunctionRgOutput(buffer, folder, results, limit);
-
-                if (results.length >= limit) {
-                    child.kill();
-                }
-            });
-
-            child.stderr.setEncoding('utf8');
-            child.stderr.on('data', chunk => {
-                console.log(`ripgrep function query stderr: ${chunk}`);
-            });
-
-            child.on('error', error => {
-                console.log(`ripgrep function query failed: ${error}`);
-                resolve(results);
-            });
-
-            child.on('close', () => {
-                if (buffer.trim()) {
-                    this.processFunctionRgOutput(`${buffer}\n`, folder, results, limit);
-                }
-
-                resolve(results);
-            });
-        });
-    }
-
-    private buildFunctionQueryRgArgs(folder: vscode.WorkspaceFolder, query: string): string[] {
-        const args = [
-            '--json',
-            '--ignore-case',
-            '--line-number',
-            '--column',
-            '.'
-        ];
-
-        for (const pattern of this.buildFunctionDeclarationRegexes(query)) {
-            args.splice(args.length - 1, 0, '-e', pattern);
-        }
-
-        for (const pattern of this.getFunctionFileGlobs()) {
-            args.splice(args.length - 1, 0, '--glob', pattern);
-        }
-
-        for (const pattern of ExclusionPatterns.getSearchExcludePatterns(folder)) {
-            args.splice(args.length - 1, 0, '--glob', `!${pattern}`);
-        }
-
-        return args;
-    }
-
-    private buildFunctionDeclarationRegexes(query: string): string[] {
-        const namePattern = this.buildIdentifierSubsequenceRegex(query);
-
-        return [
-            `^\\s*func\\s+(?:\\([^)]*\\)\\s*)?${namePattern}\\s*(?:\\[[^\\]]+\\]\\s*)?\\(`,
-            `^\\s*(?:async\\s+)?def\\s+${namePattern}\\s*\\(`,
-            `^\\s*(?:export\\s+)?(?:async\\s+)?function\\s+${namePattern}\\s*\\(`,
-            `^\\s*(?:export\\s+)?(?:const|let|var)\\s+${namePattern}\\s*=`,
-            `^\\s*(?:async\\s+)?${namePattern}\\s*\\([^)]*\\)\\s*\\{`,
-            `^\\s*(?:(?:public|private|protected|static|final|native|synchronized|abstract|inline|extern|virtual|constexpr|const|unsigned|signed|long|short|struct|class|[\\w:<>&*\\[\\]])+\\s+)+${namePattern}\\s*\\(`
-        ];
-    }
-
-    private buildIdentifierSubsequenceRegex(query: string): string {
-        const chars = normalizeSearchText(query)
-            .split('')
-            .map(char => char.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
-            .join('[\\w$]*?');
-
-        return `(?:[A-Za-z_$][\\w$]*?)?${chars}[\\w$]*?`;
-    }
-
-    private getFunctionFileGlobs(): string[] {
-        return [
-            '*.go',
-            '*.py',
-            '*.java',
-            '*.c',
-            '*.h',
-            '*.cpp',
-            '*.hpp',
-            '*.js',
-            '*.jsx',
-            '*.ts',
-            '*.tsx',
-            '*.vue'
-        ];
-    }
-
-    private processFunctionRgOutput(
-        buffer: string,
-        folder: vscode.WorkspaceFolder,
-        results: SymbolSearchItem[],
-        limit: number
-    ): string {
-        const lines = buffer.split('\n');
-        const remainder = lines.pop() || '';
-
-        for (const line of lines) {
-            if (results.length >= limit || !line.trim()) {
-                continue;
-            }
-
-            try {
-                const event = JSON.parse(line) as RgMatch;
-
-                if (event.type !== 'match' || !event.data) {
-                    continue;
-                }
-
-                const item = this.createFunctionSymbolItem(folder, event.data);
-
-                if (item) {
-                    results.push(item);
-                }
-            } catch (error) {
-                console.log(`Error parsing function index output: ${error}`);
-            }
-        }
-
-        return remainder;
-    }
-
-    private createFunctionSymbolItem(folder: vscode.WorkspaceFolder, data: NonNullable<RgMatch['data']>): SymbolSearchItem | undefined {
-        const relativePath = data.path?.text;
-        const lineText = data.lines?.text;
-        const lineNumber = data.line_number;
-
-        if (!relativePath || !lineText || !lineNumber) {
-            return undefined;
-        }
-
-        const uri = vscode.Uri.joinPath(folder.uri, relativePath);
-
-        if (!isWorkspaceFile(uri) || ExclusionPatterns.shouldExclude(uri)) {
-            return undefined;
-        }
-
-        const parsedFunction = this.parseFunctionLine(uri.fsPath, lineText);
-
-        if (!parsedFunction) {
-            return undefined;
-        }
-
-        const kind = parsedFunction.isMethod ? vscode.SymbolKind.Method : vscode.SymbolKind.Function;
-        const range = new vscode.Range(
-            new vscode.Position(lineNumber - 1, parsedFunction.offset),
-            new vscode.Position(lineNumber - 1, parsedFunction.offset + parsedFunction.name.length)
-        );
-
-        return {
-            id: `symbol:${parsedFunction.name}:${uri.toString()}:${range.start.line}:${range.start.character}`,
-            label: parsedFunction.name,
-            description: parsedFunction.isMethod && parsedFunction.container ? `Method - ${parsedFunction.container}` : 'Function',
-            detail: uri.fsPath,
-            type: SearchItemType.Symbol,
-            uri,
-            range,
-            symbolKind: kind,
-            symbolGroup: SymbolKindGroup.Function,
-            priority: 90,
-            iconPath: new vscode.ThemeIcon('symbol-method'),
-            action: async () => {
-                const document = await vscode.workspace.openTextDocument(uri);
-                const editor = await vscode.window.showTextDocument(document);
-
-                editor.selection = new vscode.Selection(range.start, range.start);
-                editor.revealRange(range, vscode.TextEditorRevealType.InCenter);
-            }
-        };
-    }
-
-    private parseFunctionLine(filePath: string, lineText: string): ParsedFunction | undefined {
-        const lowerPath = filePath.toLowerCase();
-
-        if (lowerPath.endsWith('.go')) {
-            return this.parseFunctionWithRegex(lineText, /^(\s*)func\s+(?:\(([^)]*)\)\s*)?([A-Za-z_]\w*)\s*(?:\[[^\]]+\]\s*)?\(/, 3, 2);
-        }
-
-        if (lowerPath.endsWith('.py')) {
-            return this.parseFunctionWithRegex(lineText, /^(\s*)(?:async\s+)?def\s+([A-Za-z_]\w*)\s*\(/, 2);
-        }
-
-        if (/\.(?:js|jsx|ts|tsx|vue)$/.test(lowerPath)) {
-            return this.parseJsLikeFunctionLine(lineText);
-        }
-
-        if (/\.(?:java|c|h|cpp|hpp)$/.test(lowerPath)) {
-            return this.parseCStyleFunctionLine(lineText);
-        }
-
-        return undefined;
-    }
-
-    private parseJsLikeFunctionLine(lineText: string): ParsedFunction | undefined {
-        return this.parseFunctionWithRegex(lineText, /^(\s*)(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(/, 2) ||
-            this.parseFunctionWithRegex(lineText, /^(\s*)(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=/, 2) ||
-            this.parseFunctionWithRegex(lineText, /^(\s*)(?:async\s+)?([A-Za-z_$][\w$]*)\s*\([^)]*\)\s*\{/, 2, undefined, true);
-    }
-
-    private parseCStyleFunctionLine(lineText: string): ParsedFunction | undefined {
-        const trimmed = lineText.trim();
-
-        if (!trimmed || trimmed.startsWith('//') || trimmed.startsWith('*') || trimmed.endsWith(';')) {
-            return undefined;
-        }
-
-        return this.parseFunctionWithRegex(
-            lineText,
-            /^(\s*)(?:(?:public|private|protected|static|final|native|synchronized|abstract|inline|extern|virtual|constexpr|const|unsigned|signed|long|short|struct|class|[\w:<>\*\&\[\]])+\s+)+([A-Za-z_$][\w$]*)\s*\(/,
-            2
-        );
-    }
-
-    private parseFunctionWithRegex(
-        lineText: string,
-        regex: RegExp,
-        nameGroup: number,
-        containerGroup?: number,
-        forceMethod: boolean = false
-    ): ParsedFunction | undefined {
-        const match = regex.exec(lineText);
-
-        if (!match) {
-            return undefined;
-        }
-
-        const name = match[nameGroup];
-        const container = containerGroup !== undefined ? match[containerGroup]?.trim() : undefined;
-        const offset = lineText.indexOf(name, match[1]?.length || 0);
-
-        if (!name || offset < 0) {
-            return undefined;
-        }
-
-        return {
-            name,
-            offset,
-            container,
-            isMethod: forceMethod || Boolean(container)
-        };
-    }
-
-    private getRgCommand(): string {
-        const bundledRg = path.join(vscode.env.appRoot, 'node_modules', '@vscode', 'ripgrep', 'bin', process.platform === 'win32' ? 'rg.exe' : 'rg');
-
-        if (fs.existsSync(bundledRg)) {
-            return bundledRg;
-        }
-
-        return 'rg';
     }
 
     private async loadIndexCache(progress?: vscode.Progress<{ message?: string; increment?: number }>): Promise<void> {
@@ -904,9 +658,12 @@ export class SearchService {
         };
 
         if (item.type === SearchItemType.File && 'uri' in item && item.uri instanceof vscode.Uri) {
+            const fileItem = item as FileSearchItem;
+
             return {
                 ...baseItem,
-                uri: item.uri.toString()
+                uri: item.uri.toString(),
+                isDirectory: fileItem.isDirectory
             };
         }
 
@@ -941,10 +698,15 @@ export class SearchService {
                 detail: item.detail,
                 type: SearchItemType.File,
                 uri,
-                iconPath: new vscode.ThemeIcon('file'),
+                isDirectory: item.isDirectory,
+                iconPath: new vscode.ThemeIcon(item.isDirectory ? 'folder' : 'file'),
                 priority: item.priority,
                 action: async () => {
-                    await vscode.window.showTextDocument(uri);
+                    if (item.isDirectory) {
+                        await vscode.commands.executeCommand('revealInExplorer', uri);
+                    } else {
+                        await vscode.window.showTextDocument(uri);
+                    }
                 }
             };
 
@@ -1031,94 +793,148 @@ export class SearchService {
     }
 
     /**
-     * Search for items matching the query
+     * Compatibility entry point for callers that want one completed result set.
+     * The UI calls each contributor separately so fast contributors can appear
+     * immediately while the slower text search is still running.
      */
-    public async search(query: string, options: { includeText?: boolean; includeFunctions?: boolean; textOnly?: boolean } = {}): Promise<SearchItem[]> {
-        this.startIndexing();
+    public async search(query: string, options: SearchOptions = {}): Promise<SearchItem[]> {
+        const parsedQuery = parseSearchQuery(query);
 
-        const trimmedQuery = query.trim();
-
-        if (!trimmedQuery) {
+        if (!parsedQuery.term) {
             return [];
         }
 
-        const fileLocationQuery = parseFileLocationQuery(trimmedQuery);
-        const searchQuery = fileLocationQuery?.pathQuery || trimmedQuery;
+        const allowedTypes = options.types ? new Set(options.types) : undefined;
+        const includeSymbols = options.includeSymbols !== false &&
+            (!allowedTypes || allowedTypes.has(SearchItemType.Symbol) || allowedTypes.has(SearchItemType.Class));
+        const includeText = options.includeText === true &&
+            (!allowedTypes || allowedTypes.has(SearchItemType.TextMatch));
+        const contributors: Array<Promise<SearchItem[]>> = [this.searchIndexed(query, options.types)];
 
-        if (options.textOnly) {
-            return this.searchText(searchQuery);
+        if (includeSymbols) {
+            contributors.push(this.searchSymbols(query, options.types));
+        }
+
+        if (includeText) {
+            contributors.push(this.searchText(query));
+        }
+
+        return this.mergeResults(query, await Promise.all(contributors));
+    }
+
+    public async searchIndexed(query: string, types?: SearchItemType[]): Promise<SearchItem[]> {
+        this.startIndexing();
+
+        const parsedQuery = parseSearchQuery(query);
+
+        if (!parsedQuery.term) {
+            return [];
         }
 
         await this.cacheLoadPromise;
 
-        let results: SearchItem[] = [];
-        const queryLimit = Math.min(this.config.performance.maxResults * 5, 1000);
-        const directFileResults = fileLocationQuery
-            ? this.findDirectFileLocationMatches(fileLocationQuery, queryLimit)
+        const cacheKey = this.getQueryCacheKey(parsedQuery, types);
+        const cachedResults = this.getCachedQueryResults(this.indexedResultCache, cacheKey);
+
+        if (cachedResults) {
+            return cachedResults;
+        }
+
+        const fileLocationQuery = parsedQuery.exact ? undefined : parseFileLocationQuery(parsedQuery.term);
+        const searchTerm = fileLocationQuery?.pathQuery || parsedQuery.term;
+        const allowedTypes = types ? new Set(types) : undefined;
+        let candidates = allowedTypes
+            ? this.allItems.filter(item => allowedTypes.has(item.type))
+            : this.allItems.filter(item => item.type === SearchItemType.File || item.type === SearchItemType.Command);
+
+        if (parsedQuery.exact) {
+            candidates = candidates.filter(item => this.isDirectContributorMatch(item, parsedQuery.term));
+        }
+
+        const contributorLimit = Math.min(Math.max(this.config.performance.maxResults * 5, 100), 1000);
+        const directFileResults = fileLocationQuery && (!allowedTypes || allowedTypes.has(SearchItemType.File))
+            ? this.findDirectFileLocationMatches(fileLocationQuery, contributorLimit)
             : [];
-
-        // Perform fuzzy search on indexed items
-        const fuzzyResults = await this.searcher.search(
-            this.allItems,
-            searchQuery,
-            queryLimit
-        );
-        const compactSubsequenceResults = this.searchCompactSubsequenceMatches(searchQuery, queryLimit);
-
-        // The active matcher scores both label and path, so keep this to one full scan.
-        results = this.deduplicateResults([...directFileResults, ...fuzzyResults, ...compactSubsequenceResults]);
+        const fuzzyResults = await this.searcher.search(candidates, searchTerm, contributorLimit);
+        const compactSubsequenceResults = this.searchCompactSubsequenceMatches(candidates, searchTerm, contributorLimit);
+        let results = this.deduplicateResults([...directFileResults, ...fuzzyResults, ...compactSubsequenceResults]);
 
         if (fileLocationQuery) {
             results = results.map(item => this.applyFileLocationToSearchItem(item, fileLocationQuery));
         }
 
-        if (options.includeFunctions !== false && this.shouldSearchFunctionNamesOnDemand(searchQuery, results.length)) {
-            const functionResults = await this.searchFunctionNamesOnDemand(searchQuery, queryLimit);
+        const rankedResults = this.rankResults(results, parsedQuery)
+            .slice(0, contributorLimit);
 
-            results = this.deduplicateResults([...results, ...functionResults]);
+        this.cacheQueryResults(this.indexedResultCache, cacheKey, rankedResults);
+
+        return rankedResults;
+    }
+
+    public async searchSymbols(query: string, types?: SearchItemType[]): Promise<SearchItem[]> {
+        const parsedQuery = parseSearchQuery(query);
+
+        if (!parsedQuery.term || !this.config.indexing.includeSymbols) {
+            return [];
         }
 
-        // Text search uses its own in-memory line index. It is intentionally last because
-        // large workspaces can make full-text matching noticeably slower than item lookup.
-        if (this.config.indexing.includeText && options.includeText) {
-            const textResults = await this.searchText(searchQuery);
+        const symbolProvider = this.providers.get('symbols') as SymbolSearchProvider | undefined;
 
-            results = this.deduplicateResults([...results, ...textResults]);
+        if (!symbolProvider) {
+            return [];
         }
 
-        // Boost recently modified files
-        if (this.config.activity.enabled && this.recentlyModifiedFiles.size > 0) {
-            this.boostRecentlyModifiedItems(results);
-        }
-        // Apply IDEA-style ranking across labels, paths, symbols, and text matches.
-        this.sortResultsByRelevance(results, searchQuery, false);
+        const allowedTypes = types ? new Set(types) : undefined;
+        const cacheKey = this.getQueryCacheKey(parsedQuery, types);
+        const cachedResults = this.getCachedQueryResults(this.symbolResultCache, cacheKey);
 
-        if (!options.textOnly) {
-            results = this.moveTextMatchesToBottom(results);
+        if (cachedResults) {
+            return cachedResults;
         }
 
-        // Limit to max results
-        return results.slice(0, this.config.performance.maxResults);
+        const results = (await symbolProvider.search(parsedQuery.term))
+            .filter(item => !allowedTypes || allowedTypes.has(item.type))
+            .filter(item => isStrongSymbolNameMatch(item.label, parsedQuery.term));
+        const rankedResults = this.rankResults(results, parsedQuery)
+            .slice(0, Math.max(this.config.performance.maxResults * 3, 60));
+
+        if (rankedResults.length > 0) {
+            this.cacheQueryResults(this.symbolResultCache, cacheKey, rankedResults);
+        }
+
+        return rankedResults;
     }
 
     public async searchText(query: string): Promise<SearchItem[]> {
-        if (!query.trim() || !this.config.indexing.includeText) {
+        const parsedQuery = parseSearchQuery(query);
+
+        if (!parsedQuery.term || !this.config.indexing.includeText || shouldDelayTextSearch(parsedQuery)) {
             return [];
         }
 
         try {
-            const textProvider = this.providers.get('text') as TextSearchProvider;
+            const textProvider = this.providers.get('text') as TextSearchProvider | undefined;
 
             if (!textProvider) {
                 return [];
             }
 
-            const textResults = (await textProvider.search(query))
-                .map(item => this.convertGoFunctionTextMatch(item));
+            const cacheKey = this.getQueryCacheKey(parsedQuery);
+            const cachedResults = this.getCachedQueryResults(this.textResultCache, cacheKey);
 
-            this.sortResultsByRelevance(textResults, query, true);
+            if (cachedResults) {
+                return cachedResults;
+            }
 
-            return textResults.slice(0, this.config.performance.maxTextResults);
+            const textResults = await textProvider.search(parsedQuery.textPattern);
+            const rankedResults = this.rankResults(textResults, parsedQuery)
+                .slice(0, this.config.performance.maxTextResults);
+
+            if (rankedResults.length > 0) {
+                this.cacheQueryResults(this.textResultCache, cacheKey, rankedResults);
+            }
+
+            return rankedResults;
         } catch (error) {
             console.error('Error performing text search:', error);
 
@@ -1126,8 +942,65 @@ export class SearchService {
         }
     }
 
-    public async searchFunctionNames(query: string, limit: number = this.config.performance.maxResults): Promise<SearchItem[]> {
-        return this.searchFunctionNamesOnDemand(query, limit);
+    public mergeResults(query: string, resultSets: SearchItem[][], limit: number = this.config.performance.maxResults): SearchItem[] {
+        const parsedQuery = parseSearchQuery(query);
+        const results = this.deduplicateResults(resultSets.flat());
+
+        if (this.config.activity.enabled && this.recentlyModifiedFiles.size > 0) {
+            this.boostRecentlyModifiedItems(results);
+        }
+
+        return this.rankResults(results, parsedQuery).slice(0, limit);
+    }
+
+    public cancelPendingSearches(): void {
+        (this.providers.get('text') as TextSearchProvider | undefined)?.cancelSearch();
+        (this.providers.get('symbols') as SymbolSearchProvider | undefined)?.cancelPendingSearches();
+    }
+
+    private invalidateQueryCaches(): void {
+        this.indexedResultCache.clear();
+        this.symbolResultCache.clear();
+        this.textResultCache.clear();
+        (this.providers.get('text') as TextSearchProvider | undefined)?.invalidateCache();
+        (this.providers.get('symbols') as SymbolSearchProvider | undefined)?.invalidateCache();
+    }
+
+    private invalidateTextIndex(): void {
+        (this.providers.get('text') as TextSearchProvider | undefined)?.invalidateIndex();
+    }
+
+    private getQueryCacheKey(query: ParsedSearchQuery, types?: SearchItemType[]): string {
+        const typeKey = types ? [...types].sort().join(',') : '*';
+
+        return `${query.exact ? 'exact' : 'plain'}:${query.textPattern.toLowerCase()}:${typeKey}`;
+    }
+
+    private getCachedQueryResults(cache: Map<string, SearchItem[]>, key: string): SearchItem[] | undefined {
+        const results = cache.get(key);
+
+        if (!results) {
+            return undefined;
+        }
+
+        cache.delete(key);
+        cache.set(key, results);
+
+        return [...results];
+    }
+
+    private cacheQueryResults(cache: Map<string, SearchItem[]>, key: string, results: SearchItem[]): void {
+        cache.set(key, results);
+
+        while (cache.size > SearchService.MAX_QUERY_CACHE_ENTRIES) {
+            const oldestKey = cache.keys().next().value as string | undefined;
+
+            if (!oldestKey) {
+                break;
+            }
+
+            cache.delete(oldestKey);
+        }
     }
 
     private findDirectFileLocationMatches(fileLocationQuery: FileLocationQuery, limit: number): FileSearchItem[] {
@@ -1135,6 +1008,7 @@ export class SearchService {
         const matches: Array<{ item: FileSearchItem; rank: number }> = [];
         const fileItems = this.allItems.filter((item): item is FileSearchItem =>
             item.type === SearchItemType.File &&
+            !(item as FileSearchItem).isDirectory &&
             'uri' in item &&
             item.uri instanceof vscode.Uri
         );
@@ -1167,7 +1041,7 @@ export class SearchService {
     }
 
     private applyFileLocationToSearchItem(item: SearchItem, fileLocationQuery: FileLocationQuery, priorityBoost: number = 1400): SearchItem {
-        if (item.type !== SearchItemType.File || !('uri' in item) || !(item.uri instanceof vscode.Uri)) {
+        if (item.type !== SearchItemType.File || (item as FileSearchItem).isDirectory || !('uri' in item) || !(item.uri instanceof vscode.Uri)) {
             return item;
         }
 
@@ -1204,61 +1078,6 @@ export class SearchService {
         editor.revealRange(range, vscode.TextEditorRevealType.InCenter);
     }
 
-    private convertGoFunctionTextMatch(item: TextMatchItem): SearchItem {
-        if (!item.uri.fsPath.endsWith('.go')) {
-            return item;
-        }
-
-        const lineText = item.lineText || item.label;
-        const match = /^(\s*)func\s+(?:\(([^)]*)\)\s*)?([A-Za-z_]\w*)\s*(?:\[[^\]]+\]\s*)?\(/.exec(lineText);
-
-        if (!match) {
-            return item;
-        }
-
-        const receiver = match[2]?.trim();
-        const name = match[3];
-        const nameOffset = lineText.indexOf(name, match[1].length + 4);
-
-        if (nameOffset < 0) {
-            return item;
-        }
-
-        const kind = receiver ? vscode.SymbolKind.Method : vscode.SymbolKind.Function;
-        const start = new vscode.Position(item.range.start.line, nameOffset);
-        const end = new vscode.Position(item.range.start.line, nameOffset + name.length);
-        const range = new vscode.Range(start, end);
-        const symbolItem: SymbolSearchItem = {
-            id: `symbol:${name}:${item.uri.toString()}:${range.start.line}:${range.start.character}`,
-            label: name,
-            description: receiver ? `Method - ${receiver}` : 'Function',
-            detail: item.uri.fsPath,
-            type: SearchItemType.Symbol,
-            uri: item.uri,
-            range,
-            symbolKind: kind,
-            symbolGroup: SymbolKindGroup.Function,
-            priority: 90,
-            iconPath: new vscode.ThemeIcon('symbol-method'),
-            action: async () => {
-                const document = await vscode.workspace.openTextDocument(item.uri);
-                const editor = await vscode.window.showTextDocument(document);
-
-                editor.selection = new vscode.Selection(range.start, range.start);
-                editor.revealRange(range, vscode.TextEditorRevealType.InCenter);
-            }
-        };
-
-        return symbolItem;
-    }
-
-    private moveTextMatchesToBottom(results: SearchItem[]): SearchItem[] {
-        const nonTextResults = results.filter(item => item.type !== SearchItemType.TextMatch);
-        const textResults = results.filter(item => item.type === SearchItemType.TextMatch);
-
-        return [...nonTextResults, ...textResults];
-    }
-
     private deduplicateResults(items: SearchItem[]): SearchItem[] {
         const deduplicationMap = new Map<string, SearchItem>();
 
@@ -1273,7 +1092,7 @@ export class SearchService {
         return [...deduplicationMap.values()];
     }
 
-    private searchCompactSubsequenceMatches(query: string, limit: number): SearchItem[] {
+    private searchCompactSubsequenceMatches(items: SearchItem[], query: string, limit: number): SearchItem[] {
         const normalizedQuery = normalizeSearchText(query);
 
         if (!normalizedQuery) {
@@ -1283,7 +1102,7 @@ export class SearchService {
         const matches: Array<{ item: SearchItem; rank: number }> = [];
         const trimAt = Math.max(limit * 4, limit + 50);
 
-        for (const item of this.allItems) {
+        for (const item of items) {
             const labelRank = getCompactSubsequenceRank(normalizeSearchText(item.label || ''), normalizedQuery, 6200);
             const pathRank = getCompactSubsequenceRank(normalizeSearchText(this.getItemPathText(item)), normalizedQuery, 3600);
             const rank = Math.max(labelRank, pathRank);
@@ -1306,57 +1125,6 @@ export class SearchService {
         return matches.slice(0, limit).map(match => match.item);
     }
 
-    private shouldSearchFunctionNamesOnDemand(query: string, resultCount: number): boolean {
-        const normalizedQuery = normalizeSearchText(query);
-
-        return normalizedQuery.length >= 3 &&
-            this.isFunctionNameQuery(query) &&
-            resultCount < this.config.performance.maxResults;
-    }
-
-    private async searchFunctionNamesOnDemand(query: string, limit: number): Promise<SearchItem[]> {
-        const normalizedQuery = normalizeSearchText(query);
-
-        if (!normalizedQuery || normalizedQuery.length < 3 || !this.isFunctionNameQuery(query)) {
-            return [];
-        }
-
-        const matches: Array<{ item: SearchItem; rank: number }> = [];
-        const maxScanResults = Math.max(this.config.performance.maxResults * 20, 2000);
-
-        for (const folder of vscode.workspace.workspaceFolders || []) {
-            const items = await this.findFunctionCandidatesInFolder(folder, normalizedQuery, maxScanResults);
-
-            for (const item of items) {
-                const label = normalizeSearchText(item.label || '');
-                const pathText = normalizeSearchText(this.getItemPathText(item));
-                const exactRank = label.includes(normalizedQuery) ? 10000 : 0;
-                const rank = Math.max(
-                    exactRank,
-                    getCompactSubsequenceRank(label, normalizedQuery, 6200),
-                    getCompactSubsequenceRank(pathText, normalizedQuery, 3600)
-                );
-
-                if (rank <= 0) {
-                    continue;
-                }
-
-                item.score = Math.max(item.score || 0, rank / 10000);
-                matches.push({ item, rank: rank + (item.priority || 0) });
-            }
-        }
-
-        matches.sort((a, b) => b.rank - a.rank || a.item.label.localeCompare(b.item.label));
-
-        return matches.slice(0, limit).map(match => match.item);
-    }
-
-    private isFunctionNameQuery(query: string): boolean {
-        const trimmed = query.trim();
-
-        return /^[A-Za-z0-9_$]+$/.test(trimmed);
-    }
-
     /**
      * Get useful items for an empty query, similar to a recent files list.
      */
@@ -1366,6 +1134,7 @@ export class SearchService {
 
         const fileItems = this.allItems.filter((item): item is FileSearchItem =>
             item.type === SearchItemType.File &&
+            !(item as FileSearchItem).isDirectory &&
             'uri' in item &&
             item.uri instanceof vscode.Uri
         );
@@ -1384,59 +1153,41 @@ export class SearchService {
             .slice(0, this.config.performance.maxResults);
     }
 
-    private sortResultsByRelevance(results: SearchItem[], query: string, textOnlyMode: boolean): void {
-        const normalizedQuery = normalizeSearchText(query);
-        const rawQuery = query.trim().toLowerCase();
+    private rankResults(results: SearchItem[], query: ParsedSearchQuery): SearchItem[] {
+        const rankedResults = results.map(item => ({
+            item,
+            rank: this.getResultRank(item, query)
+        }));
 
-        results.sort((a, b) => {
-            const rankDiff = this.getResultRank(b, normalizedQuery, rawQuery, textOnlyMode) -
-                this.getResultRank(a, normalizedQuery, rawQuery, textOnlyMode);
+        rankedResults.sort((a, b) => {
+            const rankDiff = b.rank - a.rank;
 
             if (rankDiff !== 0) {
                 return rankDiff;
             }
 
-            return a.label.localeCompare(b.label);
+            return a.item.label.localeCompare(b.item.label);
         });
+
+        return rankedResults.map(result => result.item);
     }
 
-    private getResultRank(item: SearchItem, normalizedQuery: string, rawQuery: string, textOnlyMode: boolean): number {
+    private getResultRank(item: SearchItem, query: ParsedSearchQuery): number {
+        const normalizedQuery = normalizeSearchText(query.term);
+
+        if (!normalizedQuery) {
+            return item.priority || 0;
+        }
+
         const label = item.label || '';
-        const labelLower = label.toLowerCase();
-        const normalizedLabel = normalizeSearchText(label);
         const pathText = this.getItemPathText(item);
-        const normalizedPath = normalizeSearchText(pathText);
+        const labelRank = getMatchQualityRank(label, query.term, 12000, 10500, 8200, 5000);
+        const pathRank = getMatchQualityRank(pathText, query.term, 7600, 6800, 4800, 2800);
         let rank = item.priority || 0;
 
-        if (normalizedLabel === normalizedQuery) {
-            rank += 10000;
-        } else if (labelLower === rawQuery) {
-            rank += 9800;
-        } else if (normalizedLabel.startsWith(normalizedQuery)) {
-            rank += 9000;
-        } else {
-            const labelIndex = normalizedLabel.indexOf(normalizedQuery);
-
-            if (labelIndex >= 0) {
-                rank += 7600 - Math.min(labelIndex, 500);
-            }
-        }
-
-        rank += getCompactSubsequenceRank(normalizedLabel, normalizedQuery, 6200);
-
-        if (normalizedPath === normalizedQuery) {
-            rank += 8200;
-        } else if (normalizedPath.endsWith(normalizedQuery)) {
-            rank += 7000;
-        } else {
-            const pathIndex = normalizedPath.indexOf(normalizedQuery);
-
-            if (pathIndex >= 0) {
-                rank += 5200 - Math.min(pathIndex, 1000);
-            }
-        }
-
-        rank += getCompactSubsequenceRank(normalizedPath, normalizedQuery, 3600);
+        // The strongest field determines relevance. A weak path subsequence may
+        // break close ties, but must not overwhelm an exact label/content hit.
+        rank += Math.max(labelRank, pathRank) + Math.min(labelRank, pathRank) * 0.15;
 
         if (typeof item.score === 'number') {
             rank += item.score * 100;
@@ -1444,27 +1195,33 @@ export class SearchService {
 
         switch (item.type) {
             case SearchItemType.Class:
-                rank += 900;
+                rank += 500;
                 break;
 
             case SearchItemType.Symbol:
-                rank += 800;
+                rank += 400;
                 break;
 
             case SearchItemType.File:
-                rank += 700;
-                break;
+                rank += 250;
 
-            case SearchItemType.TextMatch:
-                rank -= textOnlyMode ? 1800 : 9000;
-
-                if (this.isLowValueTextMatch(item)) {
-                    rank -= 2500;
+                if ((item as FileSearchItem).isDirectory) {
+                    rank += normalizeSearchText(item.label) === normalizedQuery ? 2500 : 500;
                 }
                 break;
 
             case SearchItemType.Command:
                 rank += 100;
+                break;
+
+            case SearchItemType.TextMatch:
+                if (query.exact) {
+                    rank += 5000;
+                }
+
+                if (this.isLowValueTextMatch(item)) {
+                    rank -= 2500;
+                }
                 break;
         }
 
@@ -1485,11 +1242,22 @@ export class SearchService {
     }
 
     private getItemPathText(item: SearchItem): string {
+        if (item.type === SearchItemType.File || item.type === SearchItemType.TextMatch) {
+            return item.description || '';
+        }
+
         if ('uri' in item && item.uri instanceof vscode.Uri) {
-            return `${vscode.workspace.asRelativePath(item.uri)} ${item.detail || ''}`;
+            return vscode.workspace.asRelativePath(item.uri);
         }
 
         return `${item.description || ''} ${item.detail || ''}`;
+    }
+
+    private isDirectContributorMatch(item: SearchItem, query: string): boolean {
+        const normalizedQuery = normalizeSearchText(query);
+
+        return normalizeSearchText(item.label).includes(normalizedQuery) ||
+            normalizeSearchText(this.getItemPathText(item)).includes(normalizedQuery);
     }
 
     /**
@@ -1576,6 +1344,7 @@ interface CachedSearchItem {
     type: SearchItemType;
     priority?: number;
     uri?: string;
+    isDirectory?: boolean;
     range?: CachedRange;
     symbolKind?: vscode.SymbolKind;
     symbolGroup?: SymbolKindGroup;
@@ -1646,6 +1415,86 @@ function parseFileLocationQuery(query: string): FileLocationQuery | undefined {
 
 function normalizeSearchText(value: string): string {
     return value.toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+function shouldDelayTextSearch(query: ParsedSearchQuery): boolean {
+    return !query.exact && /^[A-Za-z0-9_$]+$/.test(query.term) && query.term.length < 3;
+}
+
+function isStrongSymbolNameMatch(label: string, query: string): boolean {
+    const normalizedLabel = normalizeSearchText(label);
+    const normalizedQuery = normalizeSearchText(query);
+
+    if (!normalizedLabel || !normalizedQuery) {
+        return false;
+    }
+
+    if (normalizedLabel.includes(normalizedQuery)) {
+        return true;
+    }
+
+    const acronym = label
+        .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+        .split(/[^A-Za-z0-9]+/)
+        .filter(Boolean)
+        .map(part => part[0])
+        .join('')
+        .toLowerCase();
+
+    return acronym.includes(normalizedQuery);
+}
+
+function getMatchQualityRank(
+    text: string,
+    query: string,
+    exactRank: number,
+    prefixRank: number,
+    substringRank: number,
+    subsequenceRank: number
+): number {
+    const normalizedText = normalizeSearchText(text);
+    const normalizedQuery = normalizeSearchText(query);
+
+    if (!normalizedText || !normalizedQuery) {
+        return 0;
+    }
+
+    if (normalizedText === normalizedQuery) {
+        return exactRank;
+    }
+
+    if (normalizedText.startsWith(normalizedQuery)) {
+        return prefixRank;
+    }
+
+    const rawIndex = text.toLowerCase().indexOf(query.toLowerCase());
+
+    if (rawIndex >= 0) {
+        const segmentBonus = isIdentifierSegment(text, rawIndex, rawIndex + query.length) ? 2200 : 0;
+
+        return substringRank + segmentBonus - Math.min(rawIndex, 500);
+    }
+
+    const normalizedIndex = normalizedText.indexOf(normalizedQuery);
+
+    if (normalizedIndex >= 0) {
+        return substringRank + 800 - Math.min(normalizedIndex, 500);
+    }
+
+    return getCompactSubsequenceRank(normalizedText, normalizedQuery, subsequenceRank);
+}
+
+function isIdentifierSegment(text: string, start: number, end: number): boolean {
+    const before = start > 0 ? text[start - 1] : '';
+    const first = text[start] || '';
+    const last = end > start ? text[end - 1] : '';
+    const after = end < text.length ? text[end] : '';
+    const startsAtBoundary = !before || /[^A-Za-z0-9_$]/.test(before) ||
+        (/[a-z0-9]/.test(before) && /[A-Z]/.test(first));
+    const endsAtBoundary = !after || /[^A-Za-z0-9_$]/.test(after) ||
+        (/[a-z0-9]/.test(last) && /[A-Z]/.test(after));
+
+    return startsAtBoundary && endsAtBoundary;
 }
 
 function getCompactSubsequenceRank(text: string, query: string, base: number): number {
