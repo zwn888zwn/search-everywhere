@@ -804,7 +804,7 @@ function isBinaryContent(bytes: Uint8Array): boolean {
     return false;
 }
 
-function getTextMatchPriority(lineText: string, start: number, end: number): number {
+export function getTextMatchPriority(lineText: string, start: number, end: number): number {
     const before = start > 0 ? lineText[start - 1] : '';
     const first = lineText[start] || '';
     const last = end > start ? lineText[end - 1] : '';
@@ -815,10 +815,10 @@ function getTextMatchPriority(lineText: string, start: number, end: number): num
     const endsToken = !after || /[^A-Za-z0-9_$]/.test(after) || endsCamelSegment;
 
     if (startsCamelSegment && endsToken) {
-        return 4000;
+        return 40;
     }
 
-    return startsToken && endsToken ? 2500 : 0;
+    return startsToken && endsToken ? 25 : 0;
 }
 
 export function buildTextSearchQueryPlans(query: string): TextSearchQueryPlan[] {

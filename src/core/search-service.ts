@@ -10,6 +10,7 @@ import { TextSearchProvider } from '../providers/text-provider';
 import { parseSearchQuery, ParsedSearchQuery } from './search-query';
 import { getConfiguration } from '../utils/config';
 import { SearchFactory } from '../search/search-factory';
+import { getIdeaNameMatchScore } from '../search/fuzzysort-adapter';
 import { Debouncer } from '../utils/debouncer';
 import { isWorkspaceFile } from '../utils/workspace';
 import { ExclusionPatterns } from '../utils/exclusions';
@@ -1080,8 +1081,23 @@ export class SearchService {
 
     private deduplicateResults(items: SearchItem[]): SearchItem[] {
         const deduplicationMap = new Map<string, SearchItem>();
+        const semanticLocations = new Set(items
+            .filter(item => item.type === SearchItemType.Symbol || item.type === SearchItemType.Class)
+            .map(item => this.getSourceLineKey(item))
+            .filter((key): key is string => Boolean(key)));
 
         for (const item of items) {
+            if (item.type === SearchItemType.TextMatch) {
+                const sourceLineKey = this.getSourceLineKey(item);
+
+                // IDEA's equality providers keep the semantic PSI result when
+                // a text usage points at the same declaration. Do the same for
+                // language-server symbols and ripgrep rows from one source line.
+                if (sourceLineKey && semanticLocations.has(sourceLineKey)) {
+                    continue;
+                }
+            }
+
             const dedupeKey = this.getDeduplicationKey(item);
 
             if (!deduplicationMap.has(dedupeKey)) {
@@ -1090,6 +1106,14 @@ export class SearchService {
         }
 
         return [...deduplicationMap.values()];
+    }
+
+    private getSourceLineKey(item: SearchItem): string | undefined {
+        if (!('uri' in item) || !(item.uri instanceof vscode.Uri) || !('range' in item) || !(item.range instanceof vscode.Range)) {
+            return undefined;
+        }
+
+        return `${item.uri.toString()}:${item.range.start.line}`;
     }
 
     private searchCompactSubsequenceMatches(items: SearchItem[], query: string, limit: number): SearchItem[] {
@@ -1181,7 +1205,7 @@ export class SearchService {
 
         const label = item.label || '';
         const pathText = this.getItemPathText(item);
-        const labelRank = getMatchQualityRank(label, query.term, 12000, 10500, 8200, 5000);
+        const labelRank = getMatchQualityRank(label, query.term, 12000, 10500, 8200, 8000);
         const pathRank = getMatchQualityRank(pathText, query.term, 7600, 6800, 4800, 2800);
         let rank = item.priority || 0;
 
@@ -1195,7 +1219,10 @@ export class SearchService {
 
         switch (item.type) {
             case SearchItemType.Class:
-                rank += 500;
+                // IDEA's All tab emits type-name matches before usages and the
+                // general symbol contributor. Keep structs/interfaces/classes
+                // visible above textual call sites for camel-hump queries.
+                rank += 2500;
                 break;
 
             case SearchItemType.Symbol:
@@ -1433,15 +1460,7 @@ function isStrongSymbolNameMatch(label: string, query: string): boolean {
         return true;
     }
 
-    const acronym = label
-        .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
-        .split(/[^A-Za-z0-9]+/)
-        .filter(Boolean)
-        .map(part => part[0])
-        .join('')
-        .toLowerCase();
-
-    return acronym.includes(normalizedQuery);
+    return getIdeaNameMatchScore(label, query) > 0;
 }
 
 function getMatchQualityRank(
@@ -1460,11 +1479,11 @@ function getMatchQualityRank(
     }
 
     if (normalizedText === normalizedQuery) {
-        return exactRank;
+        return text === query ? exactRank + 300 : exactRank;
     }
 
     if (normalizedText.startsWith(normalizedQuery)) {
-        return prefixRank;
+        return text.startsWith(query) ? prefixRank + 150 : prefixRank;
     }
 
     const rawIndex = text.toLowerCase().indexOf(query.toLowerCase());
@@ -1481,7 +1500,10 @@ function getMatchQualityRank(
         return substringRank + 800 - Math.min(normalizedIndex, 500);
     }
 
-    return getCompactSubsequenceRank(normalizedText, normalizedQuery, subsequenceRank);
+    return Math.max(
+        getIdeaNameMatchScore(text, query, subsequenceRank),
+        getCompactSubsequenceRank(normalizedText, normalizedQuery, subsequenceRank)
+    );
 }
 
 function isIdentifierSegment(text: string, start: number, end: number): boolean {

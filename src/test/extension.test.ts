@@ -10,10 +10,10 @@ import { SearchService } from '../core/search-service';
 import { parseSearchQuery } from '../core/search-query';
 import { FilterCategory, SearchUI } from '../ui/search-ui';
 import { FileSearchItem, SearchItem, SearchItemType, SymbolSearchItem, TextMatchItem } from '../core/types';
-import { buildTextSearchQueryPlans, getBundledRgCandidates, TextSearchProvider } from '../providers/text-provider';
+import { buildTextSearchQueryPlans, getBundledRgCandidates, getTextMatchPriority, TextSearchProvider } from '../providers/text-provider';
 import { FileSearchProvider } from '../providers/file-provider';
 import { SymbolSearchProvider } from '../providers/symbol-provider';
-import { FuzzysortAdapter } from '../search/fuzzysort-adapter';
+import { FuzzysortAdapter, getIdeaNameMatchScore } from '../search/fuzzysort-adapter';
 // import * as myExtension from '../../extension';
 
 class InMemoryMemento implements vscode.Memento {
@@ -98,6 +98,11 @@ suite('Extension Test Suite', () => {
 		]);
 	});
 
+	test('Text boundary quality is only a local tie-breaker', () => {
+		assert.strictEqual(getTextMatchPriority('AddDDK1K2K3Value', 3, 9), 40);
+		assert.strictEqual(getTextMatchPriority('const sent = true', 6, 10), 25);
+	});
+
 	test('Quoted queries use the unquoted term for names and quoted text for content', () => {
 		assert.deepStrictEqual(parseSearchQuery('  "sent"  '), {
 			raw: '"sent"',
@@ -152,6 +157,47 @@ suite('Extension Test Suite', () => {
 		};
 
 		assert.deepStrictEqual(await new FuzzysortAdapter().search([item], 'zwn'), []);
+	});
+
+	test('IDEA-style matcher follows lowercase camel humps and numeric segments', () => {
+		const matches = [
+			['DateDeviceK1K2K3Value', 'ddk1k2'],
+			['NameUtilTest', 'NUT'],
+			['NameUtilTest', 'nt'],
+			['ReplacePathToMacroMap', 'replmap'],
+			['template_impl_template_list_panel', 'templipa'],
+			['NoClassDefFoundException', 'ncdfoe'],
+			['fxOo', 'foo']
+		];
+
+		for (const [name, pattern] of matches) {
+			assert.ok(getIdeaNameMatchScore(name, pattern) > 0, `expected ${pattern} to match ${name}`);
+		}
+
+		assert.strictEqual(getIdeaNameMatchScore('DateDeviceK1K2K3Value', 'ddk2k1'), 0);
+		assert.strictEqual(getIdeaNameMatchScore('NameutilTest', 'NUT'), 0);
+		assert.strictEqual(getIdeaNameMatchScore('fxoo', 'foo'), 0);
+		assert.strictEqual(getIdeaNameMatchScore('WaterSortClient', 'sent'), 0);
+		assert.ok(getIdeaNameMatchScore('Tree', '*tree') > getIdeaNameMatchScore('FooTree', '*tree'));
+		assert.ok(getIdeaNameMatchScore('PsiFileImpl', '*psfi') > getIdeaNameMatchScore('PsiJavaFileBaseImpl', '*psfi'));
+	});
+
+	test('IDEA-style ranking prefers exact case', async () => {
+		const createFile = (label: string): FileSearchItem => ({
+			id: `file:${label}`,
+			type: SearchItemType.File,
+			label,
+			description: label,
+			detail: label,
+			uri: vscode.Uri.file(`/tmp/${label}`),
+			action: async () => {}
+		});
+		const results = await new FuzzysortAdapter().search([
+			createFile('Boolean'),
+			createFile('boolean')
+		], 'boolean');
+
+		assert.deepStrictEqual(results.map(item => item.label), ['boolean', 'Boolean']);
 	});
 
 	test('Symbol provider runs one request and keeps only the latest queued query', async () => {
@@ -551,6 +597,112 @@ suite('Extension Test Suite', () => {
 
 		assert.ok(results.some(item => item.label === 'ChallengeRoomPushEventSent'));
 		assert.ok(results.every(item => item.label !== 'WaterSortClient'));
+	});
+
+	test('Symbol search keeps IDEA-style camel-hump struct matches', async () => {
+		const searchService = new SearchService(context);
+		const uri = vscode.Uri.file('/tmp/serverModel/model.go');
+		const range = new vscode.Range(new vscode.Position(92, 0), new vscode.Position(92, 27));
+		const createSymbol = (label: string): SymbolSearchItem => ({
+			id: `symbol:${label}`,
+			type: SearchItemType.Class,
+			label,
+			description: 'Struct',
+			detail: uri.fsPath,
+			uri,
+			range,
+			symbolKind: vscode.SymbolKind.Struct,
+			priority: 100,
+			action: async () => {}
+		});
+
+		(searchService as any).providers.set('symbols', {
+			search: async () => [
+				createSymbol('DateDeviceK1K2K3Value'),
+				createSymbol('UnrelatedStruct')
+			]
+		});
+
+		const results = await searchService.searchSymbols('ddk1k2');
+
+		assert.deepStrictEqual(results.map(item => item.label), ['DateDeviceK1K2K3Value']);
+	});
+
+	test('All results rank a camel-hump struct declaration above textual uses', () => {
+		const searchService = new SearchService(context);
+		const uri = vscode.Uri.file('/tmp/serverModel/model.go');
+		const range = new vscode.Range(new vscode.Position(92, 0), new vscode.Position(92, 27));
+		const structItem: SymbolSearchItem = {
+			id: 'class:DateDeviceK1K2K3Value',
+			type: SearchItemType.Class,
+			label: 'DateDeviceK1K2K3Value',
+			description: 'Struct',
+			detail: uri.fsPath,
+			uri,
+			range,
+			symbolKind: vscode.SymbolKind.Struct,
+			priority: 100,
+			action: async () => {}
+		};
+		const textItem: TextMatchItem = {
+			id: 'text:ddk',
+			type: SearchItemType.TextMatch,
+			label: 'AITutor.AddDDK1K2K3Value(Global.Db, serverModel.DateDeviceK1K2K3Value{',
+			description: 'ThothAIServer/StepByStepStream.go',
+			detail: 'Line 309',
+			uri: vscode.Uri.file('/tmp/ThothAIServer/StepByStepStream.go'),
+			range,
+			lineText: 'AITutor.AddDDK1K2K3Value(Global.Db, serverModel.DateDeviceK1K2K3Value{',
+			matchText: 'DDK1K2',
+			priority: 60,
+			score: 1,
+			action: async () => {}
+		};
+
+		const results = searchService.mergeResults('ddk1k2', [[textItem], [structItem]]);
+
+		assert.strictEqual(results[0].id, structItem.id);
+	});
+
+	test('All results keep semantic symbols over duplicate declaration text rows', () => {
+		const searchService = new SearchService(context);
+		const uri = vscode.Uri.file('/tmp/ThothAIServer/AITutor/tool.go');
+		const declarationRange = new vscode.Range(562, 5, 562, 21);
+		const usageRange = new vscode.Range(308, 8, 308, 14);
+		const symbol: SymbolSearchItem = {
+			id: 'symbol:AddDDK1K2K3Value',
+			type: SearchItemType.Symbol,
+			label: 'AddDDK1K2K3Value',
+			description: 'Function',
+			detail: uri.fsPath,
+			uri,
+			range: declarationRange,
+			symbolKind: vscode.SymbolKind.Function,
+			priority: 90,
+			action: async () => {}
+		};
+		const createText = (id: string, range: vscode.Range, label: string): TextMatchItem => ({
+			id,
+			type: SearchItemType.TextMatch,
+			label,
+			description: 'ThothAIServer/AITutor/tool.go',
+			detail: `Line ${range.start.line + 1}`,
+			uri,
+			range,
+			lineText: label,
+			matchText: 'DDK1K2',
+			priority: 70,
+			score: 1,
+			action: async () => {}
+		});
+		const declarationText = createText('text:declaration', declarationRange, 'func AddDDK1K2K3Value(...) {');
+		const usageText = createText('text:usage', usageRange, 'AITutor.AddDDK1K2K3Value(...)');
+
+		const results = searchService.mergeResults('ddk1k2', [[declarationText, usageText], [symbol]]);
+
+		assert.ok(results.some(item => item.id === symbol.id));
+		assert.ok(results.some(item => item.id === usageText.id));
+		assert.ok(results.every(item => item.id !== declarationText.id));
 	});
 
 	test('Symbol rows show a concise location and a kind-specific icon', () => {
