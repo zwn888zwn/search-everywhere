@@ -16,6 +16,10 @@ export function activate(context: vscode.ExtensionContext) {
 	// Create the search service
 	const searchService = new SearchService(context);
 
+	// Start restoring the persisted file/action index before the user opens
+	// Search Everywhere, so the first query does not pay the cache-load cost.
+	searchService.startIndexing();
+
 	// Create the search UI
 	const searchUI = new SearchUI(searchService, context);
 

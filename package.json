@@ -31,6 +31,7 @@
     "theme": "dark"
   },
   "activationEvents": [
+    "onStartupFinished",
     "onCommand:search-everywhere.search",
     "onCommand:search-everywhere.rebuildIndex"
   ],

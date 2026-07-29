@@ -597,7 +597,11 @@ export class SearchService {
             const cachedItem = JSON.parse(line) as CachedSearchItem;
             const item = this.deserializeCachedItem(cachedItem);
 
-            if (item && this.isWorkspaceScopedItem(item) && !this.isExcludedItem(item)) {
+            // The cache is written from already-filtered provider results. Re-running
+            // every exclusion glob for every cached file makes cache restore scale with
+            // both the number of files and exclusion patterns. A full refresh applies
+            // the current exclusion rules before rewriting this cache.
+            if (item && this.isWorkspaceScopedItem(item)) {
                 items.push(item);
             }
         }
