@@ -96,7 +96,7 @@ export class SearchService {
         // Watch for file changes to update indexes
         this.watchFileChanges();
 
-        // Index loading is started lazily after the search UI is visible.
+        // Index loading is started during extension activation.
     }
 
     public startIndexing(): void {
@@ -111,7 +111,7 @@ export class SearchService {
             resolveCacheLoad = resolve;
         });
 
-        void vscode.window.withProgress(
+        const cacheLoadTask = vscode.window.withProgress(
             {
                 location: vscode.ProgressLocation.Notification,
                 title: 'Loading Search Everywhere index...',
@@ -128,14 +128,13 @@ export class SearchService {
                 } finally {
                     resolveCacheLoad();
                 }
-
-                progress.report({ message: `Cache usable (${this.allItems.length} items). Waiting to refresh full index...`, increment: 0 });
-                await this.waitForBackgroundRefreshRequest();
-                progress.report({ message: 'Refreshing full workspace index...', increment: 0 });
-                await this.refreshIndex(false, false, progress);
-                progress.report({ message: `Full index ready (${this.allItems.length} items)`, increment: 100 });
             }
-        ).then(undefined, error => {
+        );
+
+        void cacheLoadTask.then(async () => {
+            await this.waitForBackgroundRefreshRequest();
+            await this.refreshIndex(false, false);
+        }, error => {
             resolveCacheLoad();
             console.error('Error starting Search Everywhere index:', error);
         });
