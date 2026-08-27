@@ -8,21 +8,18 @@ import { ExclusionPatterns } from '../utils/exclusions';
 export class FileSearchProvider implements SearchProvider {
     private fileItems: FileSearchItem[] = [];
     private indexedDirectories = new Set<string>();
-    private isRefreshing: boolean = false;
+    private refreshPromise: Promise<void> | undefined;
     private isPartial: boolean = false;
-
-    constructor() {
-        // Listen for changes in workspace files
-        vscode.workspace.onDidCreateFiles(() => this.refresh());
-        vscode.workspace.onDidDeleteFiles(() => this.refresh());
-        vscode.workspace.onDidRenameFiles(() => this.refresh());
-    }
 
     /**
      * Get all indexed file items
      */
     public async getItems(): Promise<FileSearchItem[]> {
-        if ((this.fileItems.length === 0 || this.isPartial) && !this.isRefreshing) {
+        if (this.refreshPromise) {
+            await this.refreshPromise;
+        }
+
+        if (this.fileItems.length === 0 || this.isPartial) {
             await this.refresh();
         }
 
@@ -30,7 +27,11 @@ export class FileSearchProvider implements SearchProvider {
     }
 
     public async warmUp(maxFiles: number): Promise<FileSearchItem[]> {
-        if (this.fileItems.length === 0 && !this.isRefreshing) {
+        if (this.refreshPromise) {
+            await this.refreshPromise;
+        }
+
+        if (this.fileItems.length === 0) {
             await this.refresh(maxFiles);
         }
 
@@ -41,11 +42,18 @@ export class FileSearchProvider implements SearchProvider {
      * Refresh the file index
      */
     public async refresh(maxFiles?: number): Promise<void> {
-        if (this.isRefreshing) {
+        if (this.refreshPromise) {
+            await this.refreshPromise;
+
             return;
         }
 
-        this.isRefreshing = true;
+        let resolveRefresh!: () => void;
+
+        this.refreshPromise = new Promise(resolve => {
+            resolveRefresh = resolve;
+        });
+
         console.log('Refreshing file index...');
         const startTime = performance.now();
 
@@ -95,11 +103,12 @@ export class FileSearchProvider implements SearchProvider {
         } catch (error) {
             console.error('Error refreshing file index:', error);
         } finally {
-            this.isRefreshing = false;
-
             const endTime = performance.now();
 
             console.log(`Indexed ${this.fileItems.length} files in ${endTime - startTime}ms`);
+
+            resolveRefresh();
+            this.refreshPromise = undefined;
         }
     }
 

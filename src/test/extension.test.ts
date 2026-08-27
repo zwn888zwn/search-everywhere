@@ -9,7 +9,7 @@ import * as vscode from 'vscode';
 import { SearchService } from '../core/search-service';
 import { parseSearchQuery } from '../core/search-query';
 import { FilterCategory, SearchUI } from '../ui/search-ui';
-import { FileSearchItem, SearchItem, SearchItemType, SymbolSearchItem, TextMatchItem } from '../core/types';
+import { CommandSearchItem, FileSearchItem, SearchItem, SearchItemType, SearchProvider, SymbolSearchItem, TextMatchItem } from '../core/types';
 import { buildTextSearchQueryPlans, getBundledRgCandidates, getTextMatchPriority, TextSearchProvider } from '../providers/text-provider';
 import { FileSearchProvider } from '../providers/file-provider';
 import { SymbolSearchProvider } from '../providers/symbol-provider';
@@ -141,6 +141,158 @@ suite('Extension Test Suite', () => {
 
 		assert.ok(directory, 'expected the src directory as a searchable path result');
 		assert.strictEqual((directory!.iconPath as vscode.ThemeIcon).id, 'folder');
+	});
+
+	test('Concurrent file refreshes wait for one workspace scan', async () => {
+		const provider = new FileSearchProvider();
+		const workspaceFolder = vscode.workspace.workspaceFolders![0];
+		const originalFindFiles = vscode.workspace.findFiles;
+		let findFilesCalls = 0;
+		let releaseFindFiles!: (uris: vscode.Uri[]) => void;
+		const pendingFiles = new Promise<vscode.Uri[]>(resolve => {
+			releaseFindFiles = resolve;
+		});
+
+		(vscode.workspace as any).findFiles = async () => {
+			findFilesCalls++;
+
+			return pendingFiles;
+		};
+
+		try {
+			let secondRefreshCompleted = false;
+			const firstRefresh = provider.refresh();
+			const secondRefresh = provider.refresh().then(() => {
+				secondRefreshCompleted = true;
+			});
+
+			await new Promise(resolve => setTimeout(resolve, 0));
+			assert.strictEqual(findFilesCalls, 1);
+			assert.strictEqual(secondRefreshCompleted, false);
+
+			releaseFindFiles([vscode.Uri.joinPath(workspaceFolder.uri, 'src', 'concurrent.ts')]);
+			await Promise.all([firstRefresh, secondRefresh]);
+
+			assert.strictEqual(findFilesCalls, 1);
+			assert.ok((await provider.getItems()).some(item => item.label === 'concurrent.ts'));
+		} finally {
+			(vscode.workspace as any).findFiles = originalFindFiles;
+		}
+	});
+
+	test('File-set updates replace stale files without rescanning commands', async () => {
+		const searchService = new SearchService(context);
+		const workspaceFolder = vscode.workspace.workspaceFolders![0];
+		const createFile = (name: string): FileSearchItem => {
+			const uri = vscode.Uri.joinPath(workspaceFolder.uri, 'src', name);
+
+			return {
+				id: `file:${uri.toString()}`,
+				type: SearchItemType.File,
+				label: name,
+				description: `src/${name}`,
+				detail: uri.fsPath,
+				uri,
+				action: async () => {}
+			};
+		};
+		const oldFile = createFile('old.ts');
+		const newFile = createFile('new.ts');
+		const command: CommandSearchItem = {
+			id: 'command:test.search',
+			type: SearchItemType.Command,
+			label: 'Test Search',
+			description: 'Action',
+			detail: 'test.search',
+			command: 'test.search',
+			action: async () => {}
+		};
+		const fileProvider = new FileSearchProvider();
+		const textProvider = new TextSearchProvider();
+		let fileRefreshes = 0;
+		let commandGets = 0;
+		let textRefreshes = 0;
+		let cacheWrites = 0;
+
+		(fileProvider as any).refresh = async () => {
+			fileRefreshes++;
+		};
+		(fileProvider as any).getItems = async () => [newFile];
+		(textProvider as any).refresh = async () => {
+			textRefreshes++;
+		};
+		(searchService as any).providers = new Map<string, SearchProvider>([
+			['files', fileProvider],
+			['commands', {
+				getItems: async () => {
+					commandGets++;
+
+					return [command];
+				},
+				refresh: async () => {}
+			}],
+			['text', textProvider]
+		]);
+		(searchService as any).allItems = [oldFile, command];
+		(searchService as any).saveIndexCache = async () => {
+			cacheWrites++;
+		};
+
+		await (searchService as any).updateIndexFromProviders(true);
+
+		const itemIds = ((searchService as any).allItems as SearchItem[]).map(item => item.id);
+
+		assert.deepStrictEqual(itemIds, [command.id, newFile.id]);
+		assert.strictEqual(fileRefreshes, 1);
+		assert.strictEqual(commandGets, 0);
+		assert.strictEqual(textRefreshes, 1);
+		assert.strictEqual(cacheWrites, 1);
+	});
+
+	test('Content-only updates refresh text without touching file or command indexes', async () => {
+		const searchService = new SearchService(context);
+		const fileProvider = new FileSearchProvider();
+		const textProvider = new TextSearchProvider();
+		let fileRefreshes = 0;
+		let fileGets = 0;
+		let commandGets = 0;
+		let textRefreshes = 0;
+		let cacheWrites = 0;
+
+		(fileProvider as any).refresh = async () => {
+			fileRefreshes++;
+		};
+		(fileProvider as any).getItems = async () => {
+			fileGets++;
+
+			return [];
+		};
+		(textProvider as any).refresh = async () => {
+			textRefreshes++;
+		};
+		(searchService as any).providers = new Map<string, SearchProvider>([
+			['files', fileProvider],
+			['commands', {
+				getItems: async () => {
+					commandGets++;
+
+					return [];
+				},
+				refresh: async () => {}
+			}],
+			['text', textProvider]
+		]);
+		(searchService as any).saveIndexCache = async () => {
+			cacheWrites++;
+		};
+
+		await (searchService as any).updateIndexFromProviders(false);
+
+		assert.strictEqual(fileRefreshes, 0);
+		assert.strictEqual(fileGets, 0);
+		assert.strictEqual(commandGets, 0);
+		assert.strictEqual(textRefreshes, 1);
+		assert.strictEqual(cacheWrites, 0);
 	});
 
 	test('Fuzzy search does not treat priority-only items as matches', async () => {

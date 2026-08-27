@@ -42,6 +42,7 @@ export class SearchService {
     private recentlyModifiedFiles: Map<string, number> = new Map(); // Uri -> timestamp
     private activityDebouncer: Debouncer;
     private indexUpdateDebouncer: Debouncer;
+    private fileIndexRefreshPending = false;
     private cacheLoadPromise: Promise<void>;
     private indexStartupStarted = false;
     private indexRefreshPromise: Promise<void> | undefined;
@@ -181,30 +182,30 @@ export class SearchService {
      * Watch for file changes to update the indexes
      */
     private watchFileChanges(): void {
-        // Watch for file saves - the providers will refresh internally, we need to collect their results
+        // Content saves do not change the file/action index.
         vscode.workspace.onDidSaveTextDocument(() => {
             console.log('File saved, scheduling index update...');
             this.invalidateQueryCaches();
             this.invalidateTextIndex();
-            this.scheduleIndexUpdate();
+            this.scheduleIndexUpdate(false);
         });
 
         vscode.workspace.onDidCreateFiles(() => {
             this.invalidateQueryCaches();
             this.invalidateTextIndex();
-            this.scheduleIndexUpdate();
+            this.scheduleIndexUpdate(true);
         });
 
         vscode.workspace.onDidDeleteFiles(() => {
             this.invalidateQueryCaches();
             this.invalidateTextIndex();
-            this.scheduleIndexUpdate();
+            this.scheduleIndexUpdate(true);
         });
 
         vscode.workspace.onDidRenameFiles(() => {
             this.invalidateQueryCaches();
             this.invalidateTextIndex();
-            this.scheduleIndexUpdate();
+            this.scheduleIndexUpdate(true);
         });
 
         // Do not update on document close. Previewing search results can close
@@ -215,62 +216,62 @@ export class SearchService {
     /**
      * Schedule an index update, debounced to avoid too many updates
      */
-    private scheduleIndexUpdate(): void {
+    private scheduleIndexUpdate(refreshFileIndex: boolean): void {
+        this.fileIndexRefreshPending = this.fileIndexRefreshPending || refreshFileIndex;
+
         this.indexUpdateDebouncer.debounce(() => {
             console.log('Updating search index after file changes...');
-            // Pull the latest items from all providers without forcing a full refresh
-            void this.updateIndexFromProviders();
+            const shouldRefreshFileIndex = this.fileIndexRefreshPending;
+
+            this.fileIndexRefreshPending = false;
+            void this.updateIndexFromProviders(shouldRefreshFileIndex);
         });
     }
 
     /**
-     * Update the index by getting the latest items from all providers
-     * This is faster than a full refresh because it doesn't force providers to re-index
+     * Refresh file-backed items only when the workspace file set changed. Content-only
+     * saves still rebuild the text index, but avoid rescanning commands and rewriting
+     * the file/action cache.
      */
-    private async updateIndexFromProviders(): Promise<void> {
-        // Keep already available results usable while slower providers refresh.
+    private async updateIndexFromProviders(refreshFileIndex: boolean): Promise<void> {
+        if (!refreshFileIndex) {
+            void (this.providers.get('text') as TextSearchProvider | undefined)?.refresh();
+
+            return;
+        }
+
+        const fileProvider = this.providers.get('files');
+
+        if (!(fileProvider instanceof FileSearchProvider)) {
+            void (this.providers.get('text') as TextSearchProvider | undefined)?.refresh();
+
+            return;
+        }
+
+        await fileProvider.refresh();
+        const items = await fileProvider.getItems();
         const deduplicationMap = new Map<string, SearchItem>();
 
         for (const item of this.allItems) {
-            deduplicationMap.set(this.getDeduplicationKey(item), item);
-        }
-
-        // Collect only providers that are cheap and deterministic after edits.
-        // Symbols are found on demand; pulling them here can silently run
-        // a workspace scan after the progress notification has already closed.
-        const providerEntries = [...this.providers.entries()]
-            .filter(([name]) => name === 'files' || name === 'commands');
-
-        for (const [name, provider] of providerEntries) {
-            try {
-                const items = await provider.getItems();
-
-                console.log(`Got ${items.length} items from ${name} provider after file change`);
-
-                // Deduplicate items as they come in
-                for (const item of items) {
-                    if (!this.isWorkspaceScopedItem(item)) {
-                        continue;
-                    }
-
-                    const dedupeKey = this.getDeduplicationKey(item);
-
-                    if (!deduplicationMap.has(dedupeKey)) {
-                        deduplicationMap.set(dedupeKey, item);
-                    }
-                }
-            } catch (error) {
-                console.error(`Error getting items from ${name} provider:`, error);
+            if (item.type !== SearchItemType.File) {
+                deduplicationMap.set(this.getDeduplicationKey(item), item);
             }
         }
 
-        // Update the allItems array with the latest items
+        for (const item of items) {
+            if (!this.isWorkspaceScopedItem(item)) {
+                continue;
+            }
+
+            deduplicationMap.set(this.getDeduplicationKey(item), item);
+        }
+
         this.allItems = Array.from(deduplicationMap.values());
         this.indexedResultCache.clear();
         void this.saveIndexCache();
         void (this.providers.get('text') as TextSearchProvider | undefined)?.refresh();
 
-        console.log(`Index update completed: ${this.allItems.length} items (after deduplication)`);
+        console.log(`File index update completed: ${this.allItems.length} items (after deduplication)`);
     }
 
     /**
