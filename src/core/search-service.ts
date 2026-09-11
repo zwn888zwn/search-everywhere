@@ -50,6 +50,7 @@ export class SearchService {
     private backgroundRefreshRequestPromise: Promise<void> | undefined;
     private resolveBackgroundRefreshRequest: (() => void) | undefined;
     private backgroundRefreshRequested = false;
+    private changedTextIndexUris = new Map<string, vscode.Uri>();
     private indexedResultCache = new Map<string, SearchItem[]>();
     private symbolResultCache = new Map<string, SearchItem[]>();
     private textResultCache = new Map<string, SearchItem[]>();
@@ -182,35 +183,70 @@ export class SearchService {
      * Watch for file changes to update the indexes
      */
     private watchFileChanges(): void {
+        // Workspace file operation events do not cover changes made by tools such
+        // as git. Watch the filesystem too so a complete persisted text index is
+        // never trusted after files change outside VS Code.
+        const workspaceWatcher = vscode.workspace.createFileSystemWatcher('**/*');
+
+        this.context.subscriptions.push(
+            workspaceWatcher,
+            workspaceWatcher.onDidChange(uri => this.handleWorkspaceFilesChanged([uri], false)),
+            workspaceWatcher.onDidCreate(uri => this.handleWorkspaceFilesChanged([uri], true)),
+            workspaceWatcher.onDidDelete(uri => this.handleWorkspaceFilesChanged([uri], true))
+        );
+
         // Content saves do not change the file/action index.
-        vscode.workspace.onDidSaveTextDocument(() => {
+        vscode.workspace.onDidSaveTextDocument(document => {
             console.log('File saved, scheduling index update...');
-            this.invalidateQueryCaches();
-            this.invalidateTextIndex();
-            this.scheduleIndexUpdate(false);
+            this.handleWorkspaceFilesChanged([document.uri], false);
         });
 
-        vscode.workspace.onDidCreateFiles(() => {
-            this.invalidateQueryCaches();
-            this.invalidateTextIndex();
-            this.scheduleIndexUpdate(true);
+        vscode.workspace.onDidCreateFiles(event => {
+            this.handleWorkspaceFilesChanged(event.files, true);
         });
 
-        vscode.workspace.onDidDeleteFiles(() => {
-            this.invalidateQueryCaches();
-            this.invalidateTextIndex();
-            this.scheduleIndexUpdate(true);
+        vscode.workspace.onDidDeleteFiles(event => {
+            this.handleWorkspaceFilesChanged(event.files, true);
         });
 
-        vscode.workspace.onDidRenameFiles(() => {
-            this.invalidateQueryCaches();
-            this.invalidateTextIndex();
-            this.scheduleIndexUpdate(true);
+        vscode.workspace.onDidRenameFiles(event => {
+            this.handleWorkspaceFilesChanged(
+                event.files.flatMap(file => [file.oldUri, file.newUri]),
+                true
+            );
         });
 
         // Do not update on document close. Previewing search results can close
         // documents frequently, and treating that as an index mutation makes
         // results appear/disappear after the visible indexing progress ended.
+    }
+
+    private handleWorkspaceFilesChanged(uris: readonly vscode.Uri[], refreshFileIndex: boolean): void {
+        const includedUris = uris.filter(uri =>
+            isWorkspaceFile(uri) && !ExclusionPatterns.shouldExclude(uri)
+        );
+
+        if (includedUris.length === 0) {
+            return;
+        }
+
+        this.invalidateQueryCaches();
+
+        const textProvider = this.providers.get('text') as TextSearchProvider | undefined;
+
+        if (textProvider) {
+            for (const uri of includedUris) {
+                this.changedTextIndexUris.set(uri.toString(), uri);
+            }
+
+            if (includedUris.some(uri => path.basename(uri.fsPath) === '.gitignore')) {
+                textProvider.invalidateIndex();
+            } else {
+                textProvider.markIndexStale();
+            }
+        }
+
+        this.scheduleIndexUpdate(refreshFileIndex);
     }
 
     /**
@@ -234,17 +270,19 @@ export class SearchService {
      * the file/action cache.
      */
     private async updateIndexFromProviders(refreshFileIndex: boolean): Promise<void> {
-        if (!refreshFileIndex) {
-            void (this.providers.get('text') as TextSearchProvider | undefined)?.refresh();
+        const textProvider = this.providers.get('text') as TextSearchProvider | undefined;
+        const changedTextUris = [...this.changedTextIndexUris.values()];
 
+        this.changedTextIndexUris.clear();
+        void textProvider?.refreshFiles(changedTextUris);
+
+        if (!refreshFileIndex) {
             return;
         }
 
         const fileProvider = this.providers.get('files');
 
         if (!(fileProvider instanceof FileSearchProvider)) {
-            void (this.providers.get('text') as TextSearchProvider | undefined)?.refresh();
-
             return;
         }
 
@@ -269,7 +307,6 @@ export class SearchService {
         this.allItems = Array.from(deduplicationMap.values());
         this.indexedResultCache.clear();
         void this.saveIndexCache();
-        void (this.providers.get('text') as TextSearchProvider | undefined)?.refresh();
 
         console.log(`File index update completed: ${this.allItems.length} items (after deduplication)`);
     }
@@ -969,10 +1006,6 @@ export class SearchService {
         this.textResultCache.clear();
         (this.providers.get('text') as TextSearchProvider | undefined)?.invalidateCache();
         (this.providers.get('symbols') as SymbolSearchProvider | undefined)?.invalidateCache();
-    }
-
-    private invalidateTextIndex(): void {
-        (this.providers.get('text') as TextSearchProvider | undefined)?.invalidateIndex();
     }
 
     private getQueryCacheKey(query: ParsedSearchQuery, types?: SearchItemType[]): string {

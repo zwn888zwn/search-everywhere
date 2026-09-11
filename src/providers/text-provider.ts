@@ -66,6 +66,7 @@ export class TextSearchProvider implements SearchProvider {
     private indexComplete = false;
     private cacheLoadPromise: Promise<number> | undefined;
     private refreshPromise: Promise<void> | undefined;
+    private staleCacheDeletePromise = Promise.resolve();
 
     constructor(
         private storageUri?: vscode.Uri,
@@ -181,8 +182,49 @@ export class TextSearchProvider implements SearchProvider {
         const cacheUri = this.getIndexCacheUri();
 
         if (cacheUri) {
-            void vscode.workspace.fs.delete(cacheUri).then(undefined, () => {});
+            this.staleCacheDeletePromise = this.staleCacheDeletePromise
+                .then(() => vscode.workspace.fs.delete(cacheUri))
+                .then(undefined, () => {});
         }
+    }
+
+    public markIndexStale(): void {
+        this.invalidateCache();
+        this.indexGeneration++;
+        this.indexReady = false;
+        this.cacheLoadPromise = Promise.resolve(0);
+
+        const cacheUri = this.getIndexCacheUri();
+
+        if (cacheUri) {
+            this.staleCacheDeletePromise = this.staleCacheDeletePromise
+                .then(() => vscode.workspace.fs.delete(cacheUri))
+                .then(undefined, () => {});
+        }
+    }
+
+    public async refreshFiles(uris: vscode.Uri[]): Promise<void> {
+        if (uris.length === 0) {
+            return this.refresh();
+        }
+
+        if (!this.storageUri || this.maxFileSizeBytes <= 0 || this.maxIndexBytes <= 0) {
+            return;
+        }
+
+        if (this.refreshPromise) {
+            await this.refreshPromise;
+        }
+
+        await this.staleCacheDeletePromise;
+
+        const generation = ++this.indexGeneration;
+
+        this.refreshPromise = this.updateAndPersistFiles(uris, generation).finally(() => {
+            this.refreshPromise = undefined;
+        });
+
+        return this.refreshPromise;
     }
 
     private cacheResults(key: string, results: TextMatchItem[]): void {
@@ -357,6 +399,78 @@ export class TextSearchProvider implements SearchProvider {
             `Persistent text index ready: ${files.length} files, ${trigrams.size} trigrams, ` +
             `${indexedBytes} bytes${complete ? '' : ' (capacity-limited; ripgrep fallback active)'}`
         );
+    }
+
+    private async updateAndPersistFiles(uris: vscode.Uri[], generation: number): Promise<void> {
+        if (this.indexedFiles.length === 0 || !this.indexComplete) {
+            await this.buildAndPersistIndex(generation);
+
+            return;
+        }
+
+        const changedUris = new Set(uris.map(uri => uri.toString()));
+        const persistedFiles: PersistedTextIndexFile[] = this.indexedFiles
+            .filter(file => !changedUris.has(file.uri))
+            .map(file => ({
+                uri: file.uri,
+                relativePath: file.relativePath,
+                content: file.content
+            }));
+        let indexedBytes = persistedFiles.reduce((total, file) => total + Buffer.byteLength(file.content, 'utf8'), 0);
+        let complete = true;
+
+        for (const uri of uris) {
+            if (generation !== this.indexGeneration) {
+                return;
+            }
+
+            if (!isWorkspaceFile(uri) || ExclusionPatterns.shouldExclude(uri)) {
+                continue;
+            }
+
+            try {
+                const stat = await vscode.workspace.fs.stat(uri);
+
+                if (stat.type !== vscode.FileType.File || stat.size > this.maxFileSizeBytes) {
+                    continue;
+                }
+
+                const bytes = await vscode.workspace.fs.readFile(uri);
+
+                if (isBinaryContent(bytes)) {
+                    continue;
+                }
+
+                if (indexedBytes + bytes.byteLength > this.maxIndexBytes) {
+                    complete = false;
+                    continue;
+                }
+
+                indexedBytes += bytes.byteLength;
+                persistedFiles.push({
+                    uri: uri.toString(),
+                    relativePath: vscode.workspace.asRelativePath(uri),
+                    content: Buffer.from(bytes).toString('utf8')
+                });
+            } catch (error) {
+                Logger.debug(`Removing unavailable text index file ${uri.fsPath}: ${error}`);
+            }
+        }
+
+        const { files, trigrams } = await buildRuntimeIndex(persistedFiles);
+
+        if (generation !== this.indexGeneration) {
+            return;
+        }
+
+        this.indexedFiles = files;
+        this.trigramIndex = trigrams;
+        this.indexReady = true;
+        this.indexComplete = complete;
+        this.resultCache.clear();
+        await this.persistIndex(persistedFiles, complete);
+
+        console.log(`Incrementally updated text index for ${changedUris.size} workspace files`);
     }
 
     private async persistIndex(files: PersistedTextIndexFile[], complete: boolean): Promise<void> {

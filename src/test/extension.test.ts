@@ -80,6 +80,16 @@ suite('Extension Test Suite', () => {
 		context = createTestContext(workspaceState);
 	});
 
+	teardown(async () => {
+		for (const subscription of context.subscriptions) {
+			subscription.dispose();
+		}
+
+		// Let queued filesystem notifications drain before the next test creates
+		// another workspace watcher for the same fixture directory.
+		await new Promise(resolve => setTimeout(resolve, 50));
+	});
+
 	test('Sample test', () => {
 		assert.strictEqual(-1, [1, 2, 3].indexOf(5));
 		assert.strictEqual(-1, [1, 2, 3].indexOf(0));
@@ -96,6 +106,70 @@ suite('Extension Test Suite', () => {
 		assert.deepStrictEqual(buildTextSearchQueryPlans('skipLevel'), [
 			{ pattern: 'skipLevel', useRegex: false }
 		]);
+	});
+
+	test('External workspace changes incrementally refresh the persisted text index', async function () {
+		this.timeout(5000);
+		const workspaceFolder = vscode.workspace.workspaceFolders![0];
+		const fixturePath = path.join(
+			workspaceFolder.uri.fsPath,
+			`search-everywhere-external-change-${process.pid}.go`
+		);
+
+		fs.writeFileSync(fixturePath, 'package fixture\n');
+
+		const searchService = new SearchService(context);
+		const textProvider = (searchService as any).providers.get('text') as TextSearchProvider;
+		const fixtureUri = vscode.Uri.file(fixturePath);
+		const originalContent = 'package fixture\n';
+
+		(textProvider as any).indexedFiles = [{
+			uri: fixtureUri.toString(),
+			relativePath: vscode.workspace.asRelativePath(fixtureUri),
+			content: originalContent,
+			parsedUri: fixtureUri,
+			lowerContent: originalContent,
+			lineStarts: [0]
+		}];
+		(textProvider as any).indexReady = true;
+		(textProvider as any).indexComplete = true;
+
+		let resolveInvalidation!: () => void;
+		const invalidated = new Promise<void>(resolve => {
+			resolveInvalidation = resolve;
+		});
+		const originalMarkIndexStale = textProvider.markIndexStale.bind(textProvider);
+
+		(textProvider as any).markIndexStale = () => {
+			originalMarkIndexStale();
+			resolveInvalidation();
+		};
+
+		try {
+			fs.appendFileSync(fixturePath, 'func changedOutsideVSCode() {}\n');
+
+			await Promise.race([
+				invalidated,
+				new Promise<void>((_, reject) => setTimeout(
+					() => reject(new Error('workspace file watcher did not observe the external change')),
+					3000
+				))
+			]);
+
+			assert.strictEqual((textProvider as any).indexedFiles.length, 1);
+			(searchService as any).indexUpdateDebouncer.clear();
+			await textProvider.refreshFiles([fixtureUri]);
+
+			const results = await textProvider.search('changedOutsideVSCode');
+
+			assert.ok(results.some(item => item.uri.toString() === fixtureUri.toString()));
+		} finally {
+			for (const subscription of context.subscriptions) {
+				subscription.dispose();
+			}
+			(searchService as any).indexUpdateDebouncer.clear();
+			fs.unlinkSync(fixturePath);
+		}
 	});
 
 	test('Text boundary quality is only a local tie-breaker', () => {
