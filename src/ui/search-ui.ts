@@ -671,6 +671,21 @@ export class SearchUI {
 
     private getSymbolIconId(kind: vscode.SymbolKind): string {
         switch (kind) {
+            case vscode.SymbolKind.Module:
+                return 'symbol-module';
+
+            case vscode.SymbolKind.Namespace:
+                return 'symbol-namespace';
+
+            case vscode.SymbolKind.Package:
+                return 'symbol-package';
+
+            case vscode.SymbolKind.EnumMember:
+                return 'symbol-enum-member';
+
+            case vscode.SymbolKind.TypeParameter:
+                return 'symbol-type-parameter';
+
             case vscode.SymbolKind.Class:
                 return 'symbol-class';
 

@@ -955,6 +955,40 @@ suite('Extension Test Suite', () => {
 		assert.strictEqual(item.detail, undefined);
 	});
 
+	test('Symbol rows preserve package and type metadata in their icons', () => {
+		const searchUi = new SearchUI(new SearchService(context), context);
+		const uri = vscode.Uri.joinPath(vscode.workspace.workspaceFolders![0].uri, 'main.go');
+		const kinds: [vscode.SymbolKind, string][] = [
+			[vscode.SymbolKind.Module, 'symbol-module'],
+			[vscode.SymbolKind.Namespace, 'symbol-namespace'],
+			[vscode.SymbolKind.Package, 'symbol-package'],
+			[vscode.SymbolKind.EnumMember, 'symbol-enum-member'],
+			[vscode.SymbolKind.TypeParameter, 'symbol-type-parameter']
+		];
+
+		for (const [symbolKind, iconId] of kinds) {
+			const symbol: SymbolSearchItem = {
+				id: `symbol:${symbolKind}`,
+				type: SearchItemType.Symbol,
+				label: 'example/main',
+				description: '',
+				detail: uri.fsPath,
+				uri,
+				range: new vscode.Range(12, 0, 12, 4),
+				symbolKind,
+				priority: 100,
+				// Providers may supply a generic icon; the semantic kind wins.
+				iconPath: new vscode.ThemeIcon('symbol-method'),
+				action: async () => {}
+			};
+			const item = (searchUi as any).createQuickPickItem(symbol) as vscode.QuickPickItem;
+
+			assert.strictEqual((item.iconPath as vscode.ThemeIcon).id, iconId);
+			assert.strictEqual(item.label, symbol.label);
+			assert.strictEqual(item.description, 'main.go:13');
+		}
+	});
+
 	test('Quick pick rows sanitize localized objects to strings', () => {
 		const searchService = new SearchService(context);
 		const searchUi = new SearchUI(searchService, context);
