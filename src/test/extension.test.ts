@@ -951,22 +951,25 @@ suite('Extension Test Suite', () => {
 		const item = (searchUi as any).createQuickPickItem(symbol) as vscode.QuickPickItem;
 
 		assert.strictEqual(item.description, 'Model/ChallengeRoomPush.go:41');
-		assert.strictEqual((item.iconPath as vscode.ThemeIcon).id, 'symbol-constant');
+		assert.ok(item.iconPath instanceof vscode.Uri);
+		assert.strictEqual(item.iconPath.scheme, 'data');
 		assert.strictEqual(item.detail, undefined);
 	});
 
-	test('Symbol rows preserve package and type metadata in their icons', () => {
+	test('Symbol rows use distinct bundled vector badges for semantic kinds', () => {
 		const searchUi = new SearchUI(new SearchService(context), context);
 		const uri = vscode.Uri.joinPath(vscode.workspace.workspaceFolders![0].uri, 'main.go');
-		const kinds: [vscode.SymbolKind, string][] = [
-			[vscode.SymbolKind.Module, 'symbol-module'],
-			[vscode.SymbolKind.Namespace, 'symbol-namespace'],
-			[vscode.SymbolKind.Package, 'symbol-package'],
-			[vscode.SymbolKind.EnumMember, 'symbol-enum-member'],
-			[vscode.SymbolKind.TypeParameter, 'symbol-type-parameter']
+		const kinds = [
+			vscode.SymbolKind.Class, vscode.SymbolKind.Struct, vscode.SymbolKind.Interface,
+			vscode.SymbolKind.Enum, vscode.SymbolKind.Method, vscode.SymbolKind.Function,
+			vscode.SymbolKind.Constructor, vscode.SymbolKind.Field, vscode.SymbolKind.Property,
+			vscode.SymbolKind.Variable, vscode.SymbolKind.Constant, vscode.SymbolKind.Module,
+			vscode.SymbolKind.Namespace, vscode.SymbolKind.Package, vscode.SymbolKind.EnumMember,
+			vscode.SymbolKind.TypeParameter, vscode.SymbolKind.Object
 		];
+		const icons = new Set<string>();
 
-		for (const [symbolKind, iconId] of kinds) {
+		for (const symbolKind of kinds) {
 			const symbol: SymbolSearchItem = {
 				id: `symbol:${symbolKind}`,
 				type: SearchItemType.Symbol,
@@ -983,9 +986,36 @@ suite('Extension Test Suite', () => {
 			};
 			const item = (searchUi as any).createQuickPickItem(symbol) as vscode.QuickPickItem;
 
-			assert.strictEqual((item.iconPath as vscode.ThemeIcon).id, iconId);
+			assert.ok(item.iconPath instanceof vscode.Uri);
+			const iconUri = item.iconPath.toString(true);
+
+			assert.ok(iconUri.startsWith('data:image/svg+xml;base64,'));
+			const svg = Buffer.from(iconUri.split(',')[1], 'base64').toString();
+
+			assert.ok(svg.includes('viewBox="0 0 16 16"'));
+			assert.ok(svg.includes('<path'));
+			assert.ok(!svg.includes('<text'), 'glyphs must not depend on installed fonts');
+			assert.ok(!icons.has(iconUri), `kind ${symbolKind} must have a distinct badge`);
+			icons.add(iconUri);
+			assert.strictEqual((searchUi as any).createQuickPickItem(symbol).iconPath, item.iconPath);
+			assert.strictEqual((searchUi as any).createQuickPickItem({
+				...symbol, type: SearchItemType.Class
+			}).iconPath, item.iconPath);
 			assert.strictEqual(item.label, symbol.label);
 			assert.strictEqual(item.description, 'main.go:13');
+		}
+	});
+
+	test('Non-symbol rows retain their existing icons', () => {
+		const searchUi = new SearchUI(new SearchService(context), context);
+
+		for (const type of [SearchItemType.File, SearchItemType.TextMatch, SearchItemType.Command]) {
+			const iconPath = new vscode.ThemeIcon(type === SearchItemType.Command ? 'run' : 'file');
+			const row = (searchUi as any).createQuickPickItem({
+				id: type, type, label: 'example', description: '', iconPath
+			});
+
+			assert.strictEqual(row.iconPath, iconPath);
 		}
 	});
 

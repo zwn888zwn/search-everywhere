@@ -4,6 +4,28 @@ import { SearchService } from '../core/search-service';
 import { parseSearchQuery } from '../core/search-query';
 import { getConfiguration } from '../utils/config';
 
+// Original vector badges inspired by JetBrains' symbol colors. Paths keep the
+// small glyphs independent of installed fonts and the active product icon theme.
+const SYMBOL_ICON_STYLES: Record<string, { fill: string; stroke: string; glyph: string; square?: boolean }> = {
+    'symbol-class': { fill: '#DAE8FF', stroke: '#376AC3', glyph: 'M10.5 5.5C9 3.5 5 4.5 5 8s4 4.5 5.5 2.5' },
+    'symbol-struct': { fill: '#DAE8FF', stroke: '#376AC3', glyph: 'M10.5 5H7a1.5 1.5 0 0 0 0 3h2a1.5 1.5 0 0 1 0 3H5.5' },
+    'symbol-interface': { fill: '#DBF0DE', stroke: '#337747', glyph: 'M6 5h4M8 5v6M6 11h4' },
+    'symbol-enum': { fill: '#DBF0DE', stroke: '#337747', glyph: 'M10 5H6v6h4M6 8h3' },
+    'symbol-type-parameter': { fill: '#DAE8FF', stroke: '#376AC3', glyph: 'M5 5h6M8 5v6' },
+    'symbol-function': { fill: '#ECDDFA', stroke: '#8150AB', glyph: 'M10 4.5H8.5A1.5 1.5 0 0 0 7 6v5.5M5.5 7h4' },
+    'symbol-method': { fill: '#ECDDFA', stroke: '#8150AB', glyph: 'M4.5 10.5V6.5h2v4M6.5 7.5q2-2 2.5 0v3M9 7.5q2-2 2.5 0v3' },
+    'symbol-constructor': { fill: '#ECDDFA', stroke: '#8150AB', glyph: 'M5 8h6M8 5v6' },
+    'symbol-field': { fill: '#ECDDFA', stroke: '#8150AB', glyph: 'M10 4.5H8.5A1.5 1.5 0 0 0 7 6v5.5M5.5 7h4', square: true },
+    'symbol-property': { fill: '#ECDDFA', stroke: '#8150AB', glyph: 'M6 11.5V5h2.5a2 2 0 0 1 0 4H6', square: true },
+    'symbol-variable': { fill: '#FBE8CE', stroke: '#975D20', glyph: 'M5 5.5l3 5 3-5', square: true },
+    'symbol-constant': { fill: '#FBE8CE', stroke: '#975D20', glyph: 'M10 5.5H7a2.5 2.5 0 0 0 0 5h3M5.5 12h5', square: true },
+    'symbol-enum-member': { fill: '#FBE8CE', stroke: '#975D20', glyph: 'M5.5 8H10V7a2.25 2.25 0 0 0-4.5 0v2A2.25 2.25 0 0 0 8 11h2', square: true },
+    'symbol-module': { fill: '#FBE8CE', stroke: '#975D20', glyph: 'M4.5 4.5h2v2h-2zM9.5 4.5h2v2h-2zM4.5 9.5h2v2h-2zM9.5 9.5h2v2h-2z', square: true },
+    'symbol-namespace': { fill: '#FBE8CE', stroke: '#975D20', glyph: 'M6 4.5H5v2L4 8l1 1.5v2h1M10 4.5h1v2L12 8l-1 1.5v2h-1', square: true },
+    'symbol-package': { fill: '#FBE8CE', stroke: '#975D20', glyph: 'M4.5 6L8 4l3.5 2v4L8 12l-3.5-2zM4.5 6L8 8l3.5-2M8 8v4', square: true },
+    'symbol-misc': { fill: '#E4E7ED', stroke: '#596579', glyph: 'M8 4.5L11.5 8 8 11.5 4.5 8z' }
+};
+
 /**
  * Filter categories for search results
  */
@@ -28,6 +50,7 @@ export class SearchUI {
     private previewDisposables: vscode.Disposable[] = [];
     private searchGeneration = 0;
     private isVisible = false;
+    private readonly symbolIcons = new Map<string, vscode.Uri>();
 
     // Active filter category
     private activeFilter: FilterCategory = FilterCategory.All;
@@ -661,9 +684,25 @@ export class SearchUI {
         };
     }
 
-    private getResultIcon(item: SearchItem): vscode.ThemeIcon | undefined {
+    private getResultIcon(item: SearchItem): vscode.ThemeIcon | vscode.Uri | undefined {
         if ((item.type === SearchItemType.Symbol || item.type === SearchItemType.Class) && 'symbolKind' in item) {
-            return new vscode.ThemeIcon(this.getSymbolIconId(item.symbolKind as vscode.SymbolKind));
+            const iconId = this.getSymbolIconId(item.symbolKind as vscode.SymbolKind);
+            const cached = this.symbolIcons.get(iconId);
+
+            if (cached) {
+                return cached;
+            }
+
+            const { fill, stroke, glyph, square } = SYMBOL_ICON_STYLES[iconId];
+            const shape = square
+                ? '<rect x="1.5" y="1.5" width="13" height="13" rx="3"/>'
+                : '<circle cx="8" cy="8" r="6.5"/>';
+            const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16"><g fill="${fill}" stroke="${stroke}">${shape}</g><path d="${glyph}" fill="none" stroke="${stroke}" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+            const icon = vscode.Uri.parse(`data:image/svg+xml;base64,${Buffer.from(svg).toString('base64')}`);
+
+            this.symbolIcons.set(iconId, icon);
+
+            return icon;
         }
 
         return item.iconPath instanceof vscode.ThemeIcon ? item.iconPath : undefined;
