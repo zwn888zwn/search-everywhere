@@ -1072,6 +1072,125 @@ suite('Extension Test Suite', () => {
 		}
 	});
 
+	test('Search UI selection survives same-query All incremental results', async () => {
+		const searchService = new SearchService(context);
+		const searchUi = new SearchUI(searchService, context);
+		const quickPick = (searchUi as any).quickPick as vscode.QuickPick<any>;
+		const workspaceUri = vscode.workspace.workspaceFolders![0].uri;
+		const createFile = (id: string, label: string): FileSearchItem => ({
+			id,
+			type: SearchItemType.File,
+			label,
+			description: label,
+			detail: label,
+			uri: vscode.Uri.joinPath(workspaceUri, label),
+			action: async () => {}
+		});
+		const first = createFile('file:first', 'first.go');
+		const second = createFile('file:second', 'second.go');
+		const later = createFile('file:later', 'later.go');
+		let resolveIndexed!: (items: SearchItem[]) => void;
+		let resolveSymbols!: (items: SearchItem[]) => void;
+		let resolveText!: (items: SearchItem[]) => void;
+		const indexed = new Promise<SearchItem[]>(resolve => { resolveIndexed = resolve; });
+		const symbols = new Promise<SearchItem[]>(resolve => { resolveSymbols = resolve; });
+		const text = new Promise<SearchItem[]>(resolve => { resolveText = resolve; });
+
+		(searchService as any).searchIndexed = async () => indexed;
+		(searchService as any).searchSymbols = async () => symbols;
+		(searchService as any).searchText = async () => text;
+		(searchUi as any).activeFilter = FilterCategory.All;
+		(searchUi as any).lastQuery = 'sent';
+		(searchUi as any).isVisible = true;
+
+		const pendingSearch = (searchUi as any).performSearch('sent');
+
+		resolveIndexed([first, second]);
+		await new Promise(resolve => setTimeout(resolve, 0));
+
+		const secondRow = quickPick.items.find((item: any) => item.originalItem?.id === second.id);
+
+		assert.ok(secondRow, 'expected the second indexed result to be rendered');
+		quickPick.activeItems = [secondRow];
+		quickPick.selectedItems = [secondRow];
+
+		resolveSymbols([later]);
+		resolveText([]);
+		await pendingSearch;
+
+		assert.deepStrictEqual(quickPick.activeItems.map((item: any) => item.originalItem?.id), [second.id]);
+		assert.deepStrictEqual(quickPick.selectedItems.map((item: any) => item.originalItem?.id), [second.id]);
+		assert.strictEqual(quickPick.keepScrollPosition, true);
+	});
+
+	test('Search UI selection resets when query or filter changes', () => {
+		const searchService = new SearchService(context);
+		const searchUi = new SearchUI(searchService, context);
+		const quickPick = (searchUi as any).quickPick as vscode.QuickPick<any>;
+		const item: FileSearchItem = {
+			id: 'file:selection-reset',
+			type: SearchItemType.File,
+			label: 'selection-reset.go',
+			description: 'selection-reset.go',
+			detail: 'selection-reset.go',
+			uri: vscode.Uri.joinPath(vscode.workspace.workspaceFolders![0].uri, 'selection-reset.go'),
+			action: async () => {}
+		};
+
+		(searchUi as any).activeFilter = FilterCategory.All;
+		(searchUi as any).lastQuery = 'sent';
+		(searchUi as any).updateSearchItems([item]);
+		quickPick.activeItems = [quickPick.items[0]];
+		quickPick.selectedItems = [quickPick.items[0]];
+
+		(searchUi as any).lastQuery = 'other';
+		(searchUi as any).updateSearchItems([item]);
+		assert.deepStrictEqual(quickPick.activeItems, []);
+		assert.deepStrictEqual(quickPick.selectedItems, []);
+		assert.strictEqual(quickPick.keepScrollPosition, false);
+
+		(searchUi as any).lastQuery = 'sent';
+		(searchUi as any).activeFilter = FilterCategory.All;
+		(searchUi as any).updateSearchItems([item]);
+		quickPick.activeItems = [quickPick.items[0]];
+		quickPick.selectedItems = [quickPick.items[0]];
+		(searchUi as any).activeFilter = FilterCategory.Files;
+		(searchUi as any).updateSearchItems([item]);
+
+		assert.deepStrictEqual(quickPick.activeItems, []);
+		assert.deepStrictEqual(quickPick.selectedItems, []);
+		assert.strictEqual(quickPick.keepScrollPosition, false);
+	});
+
+	test('Search UI selection clears when the selected result disappears', () => {
+		const searchService = new SearchService(context);
+		const searchUi = new SearchUI(searchService, context);
+		const quickPick = (searchUi as any).quickPick as vscode.QuickPick<any>;
+		const createFile = (id: string, label: string): FileSearchItem => ({
+			id,
+			type: SearchItemType.File,
+			label,
+			description: label,
+			detail: label,
+			uri: vscode.Uri.joinPath(vscode.workspace.workspaceFolders![0].uri, label),
+			action: async () => {}
+		});
+		const selected = createFile('file:selected', 'selected.go');
+		const replacement = createFile('file:replacement', 'replacement.go');
+
+		(searchUi as any).activeFilter = FilterCategory.All;
+		(searchUi as any).lastQuery = 'sent';
+		(searchUi as any).updateSearchItems([selected]);
+		quickPick.activeItems = [quickPick.items[0]];
+		quickPick.selectedItems = [quickPick.items[0]];
+
+		(searchUi as any).updateSearchItems([replacement]);
+
+		assert.deepStrictEqual(quickPick.activeItems, []);
+		assert.deepStrictEqual(quickPick.selectedItems, []);
+		assert.ok(quickPick.items.every((item: any) => item.originalItem?.id !== selected.id));
+	});
+
 	test('Hidden quick pick cannot be repopulated by a completed stale search', async () => {
 		const searchService = new SearchService(context);
 		const searchUi = new SearchUI(searchService, context);

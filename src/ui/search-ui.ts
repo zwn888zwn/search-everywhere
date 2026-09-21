@@ -46,6 +46,8 @@ export class SearchUI {
     private quickPick: vscode.QuickPick<SearchQuickPickItem>;
     private searchDebounce: NodeJS.Timeout | undefined;
     private lastQuery: string = '';
+    private renderedQuery: string | undefined;
+    private renderedFilter: FilterCategory | undefined;
     private config = getConfiguration();
     private previewDisposables: vscode.Disposable[] = [];
     private searchGeneration = 0;
@@ -296,6 +298,8 @@ export class SearchUI {
         const initialQuery = this.context.workspaceState.get<string>(SearchUI.LAST_QUERY_KEY, '');
 
         this.lastQuery = initialQuery;
+        this.renderedQuery = undefined;
+        this.renderedFilter = undefined;
         this.quickPick.busy = false;
         this.quickPick.keepScrollPosition = false;
         this.quickPick.activeItems = [];
@@ -469,11 +473,19 @@ export class SearchUI {
     private updateSearchItems(results: SearchItem[]): void {
         const filteredResults = this.applyCategoryFilter(results);
         const items = filteredResults.map(item => this.createQuickPickItem(item));
+        const preserveSelection = this.renderedQuery === this.lastQuery &&
+            this.renderedFilter === this.activeFilter;
+        const activeId = preserveSelection ? this.quickPick.activeItems[0]?.originalItem?.id : undefined;
+        const selectedId = preserveSelection ? this.quickPick.selectedItems[0]?.originalItem?.id : undefined;
 
-        this.quickPick.keepScrollPosition = false;
+        this.quickPick.keepScrollPosition = preserveSelection;
         this.quickPick.activeItems = [];
         this.quickPick.selectedItems = [];
         this.quickPick.items = items;
+        this.quickPick.activeItems = activeId === undefined ? [] : items.filter(item => item.originalItem?.id === activeId);
+        this.quickPick.selectedItems = selectedId === undefined ? [] : items.filter(item => item.originalItem?.id === selectedId);
+        this.renderedQuery = this.lastQuery;
+        this.renderedFilter = this.activeFilter;
     }
 
     private saveLastQuery(value: string): void {
