@@ -40,16 +40,15 @@ A fast, fuzzy "Search Everywhere" feature for VSCode, inspired by the IntelliJ/P
   
 ## Usage
 
-1. Press `Shift+Shift` to open the search dialog
-2. Use the filter buttons at the top to select what to search for:
-   - **All**: Search everything
-   - **Classes**: Search only classes, interfaces, and structs
-   - **Files**: Search only files
-   - **Symbols**: Search methods, functions, and other symbols
-   - **Actions**: Search available commands
-3. Start typing to search within the selected category
-4. Results update in real-time as you type
-5. Select an item to open/execute it
+1. Press `Shift+Shift` to open **Search Everywhere**.
+2. Choose All, Classes, Files, Symbols, Actions, or Text and type your query.
+3. **Single-click or use Up/Down** to select results. The lower code preview updates continuously while the query and candidate list remain available. Previewing never opens a source editor tab or executes an action.
+4. **Double-click, press Enter, or click Open** to open the chosen result and close the search panel.
+5. Use the preview button to hide or show the lower preview without losing the search, and drag the divider to resize it. `Escape` closes the search.
+
+The integrated layout is inspired by IDEA's Search Everywhere preview. VS Code hosts it in a dedicated **editor panel**, not in its native floating Quick Pick. The panel reads context from the current document (including unsaved edits), shows real line numbers and syntax highlighting, and highlights the selected match. Large or binary files show a preview message and can still be opened explicitly.
+
+The previous floating UI remains available as **Search Everywhere: Classic Quick Pick** in the Command Palette. Search providers, ranking, query syntax, exclusions, and result limits are shared by both interfaces.
 
 ## Configuration
 

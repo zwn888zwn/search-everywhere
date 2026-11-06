@@ -1,0 +1,77 @@
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html, body { height: 100%; margin: 0; overflow: hidden; }
+body { padding: 16px; font: 13px var(--vscode-font-family, sans-serif); color: var(--vscode-foreground, #d4d4d4); background: var(--vscode-editor-background, #1e1e1e); }
+button, input { font: inherit; }
+button { color: inherit; cursor: pointer; }
+button:focus-visible, [tabindex]:focus-visible { outline: 1px solid var(--vscode-focusBorder, #007acc); outline-offset: -1px; }
+.shell { width: min(100%, 1100px); height: 100%; max-height: 900px; margin: 0 auto; display: flex; flex-direction: column; min-height: 0; border: 1px solid var(--vscode-widget-border, #454545); border-radius: 8px; background: var(--vscode-quickInput-background, #252526); box-shadow: 0 6px 24px var(--vscode-widget-shadow, #0005); overflow: hidden; }
+header { display: flex; align-items: center; padding: 0 8px; min-height: 36px; border-bottom: 1px solid var(--vscode-widget-border, #454545); flex-shrink: 0; }
+nav { display: flex; flex: 1; min-width: 0; overflow-x: auto; }
+nav button { position: relative; border: 0; background: transparent; height: 36px; padding: 0 12px; color: var(--vscode-descriptionForeground, #999); white-space: nowrap; }
+nav button[aria-selected=true] { color: var(--vscode-foreground, #ddd); font-weight: 600; }
+nav button[aria-selected=true]::after { content: ''; height: 2px; position: absolute; bottom: 0; left: 10px; right: 10px; background: var(--vscode-focusBorder, #007acc); }
+button:hover { background: var(--vscode-toolbar-hoverBackground, #ffffff0d); }
+.icon-button { border: 0; background: transparent; width: 28px; height: 26px; padding: 0; border-radius: 4px; flex-shrink: 0; font-size: 19px; }
+.icon-button[aria-pressed=true] { color: var(--vscode-textLink-foreground, #69b3ff); }
+.search-field { margin: 8px 10px; min-height: 32px; display: flex; align-items: center; gap: 8px; border: 1px solid var(--vscode-input-border, #454545); border-radius: 5px; padding: 0 8px; background: var(--vscode-input-background, #1e1e1e); color: var(--vscode-descriptionForeground, #999); flex-shrink: 0; }
+.search-field:focus-within { border-color: var(--vscode-focusBorder, #007acc); }
+.search-field > span:first-child { font-size: 24px; }
+#query { color: var(--vscode-input-foreground, #ddd); background: transparent; border: none; outline: none; width: 100%; min-width: 0; flex: 1; height: 30px; font-size: 14px; }
+#query::-webkit-search-cancel-button { cursor: pointer; }
+#query::placeholder { color: var(--vscode-input-placeholderForeground, #888); }
+#busy { font-size: 11px; white-space: nowrap; }
+#results { flex: 0 1 38%; min-height: 48px; overflow: auto; padding: 2px 6px 6px; }
+.result { height: 28px; display: flex; align-items: center; gap: 8px; padding: 0 8px; border-radius: 4px; cursor: pointer; white-space: nowrap; min-width: 0; }
+.result:hover { background: var(--vscode-list-hoverBackground, #ffffff08); }
+.result[aria-selected=true] { background: var(--vscode-list-activeSelectionBackground, #094771); color: var(--vscode-list-activeSelectionForeground, #fff); }
+.kind { display: inline-flex; justify-content: center; align-items: center; width: 16px; height: 16px; flex-shrink: 0; border-radius: 4px; color: #8ac1fa; border: 1px solid currentColor; font-size: 10px; line-height: 1; }
+.kind-symbol { color: #caa0ed; border-radius: 50%; }
+.kind-class { color: #94bfff; border-radius: 50%; }
+.kind-text { color: var(--vscode-icon-foreground, #bbb); border: none; font-size: 20px; }
+.kind-command { color: #8bc79c; font-size: 16px; }
+.result-label { min-width: 0; max-width: 65%; flex: 0 1 auto; text-overflow: ellipsis; overflow: hidden; }
+.result-path { min-width: 0; flex: 1; color: var(--vscode-descriptionForeground, #999); font-size: 11px; overflow: hidden; text-overflow: ellipsis; }
+.result[aria-selected=true] .result-path { color: inherit; opacity: 0.8; }
+mark { background: var(--vscode-editor-findMatchHighlightBackground, #e2b75330); color: inherit; border-radius: 2px; }
+.empty-results, #preview-message { padding: 20px; color: var(--vscode-descriptionForeground, #999); white-space: pre-wrap; overflow-wrap: anywhere; }
+#splitter { height: 5px; flex-shrink: 0; background: var(--vscode-widget-border, #454545); cursor: row-resize; }
+#splitter:hover, #splitter:focus-visible { background: var(--vscode-focusBorder, #007acc); }
+#preview { flex: 1 1 auto; min-height: 64px; display: flex; flex-direction: column; background: var(--vscode-editor-background, #1e1e1e); }
+.preview-header { height: 30px; display: flex; align-items: center; gap: 10px; padding: 0 12px; flex-shrink: 0; border-bottom: 1px solid var(--vscode-widget-border, #454545); color: var(--vscode-descriptionForeground, #999); font-size: 11px; }
+#preview-path { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#language { flex-shrink: 0; font-size: 10px; }
+#open { flex-shrink: 0; padding: 1px 7px; background: transparent; color: var(--vscode-textLink-foreground, #69b3ff); border: 1px solid transparent; border-radius: 3px; font-size: 11px; }
+#open:disabled { color: var(--vscode-disabledForeground, #777); cursor: default; }
+#code-viewport { flex: 1; min-height: 0; overflow: auto; }
+#code-content { display: grid; grid-template-columns: 48px minmax(0, 1fr); width: max-content; min-width: 100%; padding: 8px 12px 8px 0; position: relative; }
+pre { margin: 0; font: 12px/20px var(--vscode-editor-font-family, monospace); tab-size: 4; white-space: pre; }
+#line-numbers { color: var(--vscode-editorLineNumber-foreground, #777); padding-right: 12px; text-align: right; user-select: none; position: sticky; left: 0; background: var(--vscode-editor-background, #1e1e1e); z-index: 1; }
+#code { position: relative; color: var(--vscode-editor-foreground, #d4d4d4); }
+#active-line { position: absolute; left: 48px; right: 0; height: 20px; background: color-mix(in srgb, var(--vscode-focusBorder, #007acc) 14%, transparent); pointer-events: none; }
+.source-match { background: var(--vscode-editor-findMatchHighlightBackground, #f0be4b44); border-bottom: 1px solid var(--vscode-editor-findMatchHighlightBorder, #e2b753); }
+#preview-note { padding: 3px 12px; font-size: 10px; color: var(--vscode-descriptionForeground, #999); }
+footer { min-height: 25px; display: flex; gap: 12px; align-items: center; justify-content: space-between; padding: 0 12px; color: var(--vscode-descriptionForeground, #999); font-size: 10px; flex-shrink: 0; border-top: 1px solid var(--vscode-widget-border, #454545); }
+footer b { margin: 0 5px; font-weight: normal; opacity: 0.5; }
+#count { max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.without-preview #results { flex: 1 1 auto; }
+* { scrollbar-color: auto; }
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track, ::-webkit-scrollbar-corner { background: transparent; }
+::-webkit-scrollbar-thumb { border-radius: 3px; background: var(--vscode-scrollbarSlider-background, #6666); }
+.hljs-keyword, .hljs-selector-tag, .hljs-literal { color: #c586c0; }
+.hljs-string, .hljs-regexp { color: #ce9178; }
+.hljs-comment, .hljs-quote { color: #6a9955; font-style: italic; }
+.hljs-number { color: #b5cea8; }
+.hljs-title, .hljs-title.function_ { color: #dcdcaa; }
+.hljs-type, .hljs-built_in, .hljs-title.class_ { color: #4ec9b0; }
+.hljs-variable, .hljs-params, .hljs-attr { color: #9cdcfe; }
+.vscode-light .hljs-keyword, .vscode-light .hljs-literal { color: #af00db; }
+.vscode-light .hljs-string, .vscode-light .hljs-regexp { color: #a31515; }
+.vscode-light .hljs-comment, .vscode-light .hljs-quote { color: #008000; }
+.vscode-light .hljs-number { color: #098658; }
+.vscode-light .hljs-title, .vscode-light .hljs-title.function_ { color: #795e26; }
+.vscode-light .hljs-type, .vscode-light .hljs-built_in, .vscode-light .hljs-title.class_ { color: #267f99; }
+.vscode-light .hljs-variable, .vscode-light .hljs-params, .vscode-light .hljs-attr { color: #001080; }
+@media (max-width: 600px) { body { padding: 6px; } nav button { padding: 0 7px; } .result-label { max-width: 58%; } footer b { margin: 0 2px; } }
+@media (max-height: 420px) { body { padding: 4px; } header, nav button { min-height: 30px; height: 30px; } .search-field { margin-top: 4px; margin-bottom: 4px; } }

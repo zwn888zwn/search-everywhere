@@ -1,0 +1,17 @@
+.vscode/**
+.vscode-test/**
+node_modules/**
+src/**
+out/**
+test-fixtures/**
+*.ts
+*.tsbuildinfo
+**/*.map
+.gitignore
+.vscode-test.js
+eslint.config.mjs
+esbuild.js
+package-lock.json
+vsc-extension-quickstart.md
+CONTRIBUTING.md
+tsconfig.json

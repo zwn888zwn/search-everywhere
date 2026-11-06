@@ -2,7 +2,7 @@
   "name": "search-everywhere",
   "displayName": "JetBrains Search Everywhere",
   "description": "PyCharm-style Search Everywhere with fuzzy search, class filter, and intelligent prioritization",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "publisher": "extruct-ai",
   "author": {
     "name": "Dimitri Persiianov"
@@ -45,6 +45,10 @@
       {
         "command": "search-everywhere.rebuildIndex",
         "title": "Search Everywhere: Rebuild Index"
+      },
+      {
+        "command": "search-everywhere.searchClassic",
+        "title": "Search Everywhere: Classic Quick Pick"
       }
     ],
     "keybindings": [
@@ -92,7 +96,7 @@
         "searchEverywhere.preview.enabled": {
           "type": "boolean",
           "default": false,
-          "description": "Automatically preview search results as you navigate through them"
+          "description": "Automatically preview results in the editor while navigating Classic Quick Pick. The integrated search panel has its own code preview."
         },
         "searchEverywhere.performance.maxResults": {
           "type": "number",
@@ -172,6 +176,7 @@
   "dependencies": {
     "fuzzaldrin-plus": "^0.6.0",
     "fuzzysort": "^2.0.4",
+    "highlight.js": "^11.11.1",
     "minimatch": "^10.0.1"
   }
 }

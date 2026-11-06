@@ -3,6 +3,7 @@
 import * as vscode from 'vscode';
 import { SearchService } from './core/search-service';
 import { SearchUI } from './ui/search-ui';
+import { SearchPanel } from './ui/search-panel';
 import Logger from './utils/logging';
 
 // This method is called when your extension is activated
@@ -21,10 +22,16 @@ export function activate(context: vscode.ExtensionContext) {
 	searchService.startIndexing();
 
 	// Create the search UI
-	const searchUI = new SearchUI(searchService, context);
+	const searchPanel = new SearchPanel(searchService, context);
+	let searchUI: SearchUI | undefined;
 
 	// Register search command
 	const searchDisposable = vscode.commands.registerCommand('search-everywhere.search', () => {
+		searchPanel.show();
+	});
+	const classicDisposable = vscode.commands.registerCommand('search-everywhere.searchClassic', () => {
+		searchPanel.close();
+		searchUI ??= new SearchUI(searchService, context);
 		searchUI.show();
 	});
 
@@ -57,7 +64,7 @@ export function activate(context: vscode.ExtensionContext) {
 	});
 
 	// Add commands to context
-	context.subscriptions.push(searchDisposable, rebuildDisposable);
+	context.subscriptions.push(searchDisposable, classicDisposable, rebuildDisposable, searchPanel);
 
 	console.log('Search Everywhere extension activated');
 }
