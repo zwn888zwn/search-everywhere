@@ -736,7 +736,8 @@ export class SearchService {
             const fileItem: FileSearchItem = {
                 id: item.id,
                 label: item.label,
-                description: item.description,
+                // Upgrade old root-relative cache paths and reflect workspace aliases.
+                description: vscode.workspace.asRelativePath(uri, true),
                 detail: item.detail,
                 type: SearchItemType.File,
                 uri,
@@ -1448,7 +1449,7 @@ function deserializeRange(range: CachedRange): vscode.Range {
 }
 
 function parseFileLocationQuery(query: string): FileLocationQuery | undefined {
-    const match = /^(.*):(\d+)(?::(\d+))?$/.exec(query.trim());
+    const match = /^(.*?):(\d+)(?::(\d+))?$/.exec(query.trim());
 
     if (!match) {
         return undefined;

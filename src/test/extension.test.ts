@@ -13,6 +13,7 @@ import { CommandSearchItem, FileSearchItem, SearchItem, SearchItemType, SearchPr
 import { buildTextSearchQueryPlans, getBundledRgCandidates, getTextMatchPriority, TextSearchProvider } from '../providers/text-provider';
 import { FileSearchProvider } from '../providers/file-provider';
 import { SymbolSearchProvider } from '../providers/symbol-provider';
+import { FuzzaldrinAdapter } from '../search/fuzzaldrin-adapter';
 import { FuzzysortAdapter, getIdeaNameMatchScore } from '../search/fuzzysort-adapter';
 // import * as myExtension from '../../extension';
 
@@ -210,12 +211,67 @@ suite('Extension Test Suite', () => {
 		await provider.refresh();
 
 		const directory = (await provider.getItems()).find(item =>
-			item.isDirectory && item.label === 'src' && item.description === 'src'
+			item.isDirectory && item.label === 'src' && item.description === `${vscode.workspace.workspaceFolders![0].name}/src`
 		);
 
 		assert.ok(directory, 'expected the src directory as a searchable path result');
 		assert.strictEqual((directory!.iconPath as vscode.ThemeIcon).id, 'folder');
 	});
+
+	for (const cached of [false, true]) {
+		for (const searcher of [new FuzzysortAdapter(), new FuzzaldrinAdapter()]) {
+			test(`Workspace-qualified file paths work with ${searcher.name} and ${cached ? 'legacy cache' : 'fresh index'}`, async () => {
+				const provider = new FileSearchProvider();
+				const service = new SearchService(context);
+				const folders = vscode.workspace.workspaceFolders!;
+
+				await provider.refresh();
+				let items = await provider.getItems();
+
+				if (cached) {
+					items = items.map(item => (service as any).deserializeCachedItem({
+						...(service as any).serializeItem(item),
+						// Previous releases persisted paths without the workspace name.
+						description: vscode.workspace.asRelativePath(item.uri, false)
+					}));
+				}
+
+				(service as any).startIndexing = () => {};
+				(service as any).allItems = items;
+				(service as any).searcher = searcher;
+
+				for (const folder of folders) {
+					const uri = vscode.Uri.joinPath(folder.uri, 'src', 'skip_level.go');
+					const qualified = `${folder.name}/src/skip_level.go`;
+
+					for (const query of [qualified, `"${qualified}"`, 'src/skip_level.go', 'skip_level.go']) {
+						for (const types of [undefined, [SearchItemType.File]]) {
+							const results = await service.searchIndexed(query, types);
+
+							assert.ok(results.some(item => (item as FileSearchItem).uri?.toString() === uri.toString()), query);
+							if (query.includes(folder.name)) {
+								assert.strictEqual((results[0] as FileSearchItem).uri.toString(), uri.toString(), 'prefer the named workspace');
+							}
+						}
+					}
+
+					for (const suffix of [':3', ':3:2']) {
+						const located = await service.searchIndexed(`${qualified}${suffix}`, [SearchItemType.File]);
+						const target = located[0] as FileSearchItem;
+
+						assert.strictEqual(target.uri.toString(), uri.toString());
+						assert.strictEqual(target.range?.start.line, 2);
+						assert.strictEqual(target.range?.start.character, suffix === ':3' ? 0 : 1);
+					}
+
+					const directories = await service.searchIndexed(`${folder.name}/src`, [SearchItemType.File]);
+
+					assert.ok(directories.some(item => (item as FileSearchItem).isDirectory &&
+						(item as FileSearchItem).uri.toString() === vscode.Uri.joinPath(folder.uri, 'src').toString()));
+				}
+			});
+		}
+	}
 
 	test('Concurrent file refreshes wait for one workspace scan', async () => {
 		const provider = new FileSearchProvider();

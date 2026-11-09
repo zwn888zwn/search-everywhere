@@ -122,7 +122,7 @@ export class FileSearchProvider implements SearchProvider {
                     continue;
                 }
 
-                // Create a relative path for display
+                // Keep the root-relative path for collecting parent directories.
                 let relativePath = uri.fsPath;
                 const workspacePath = workspaceFolder.uri.fsPath;
 
@@ -143,7 +143,8 @@ export class FileSearchProvider implements SearchProvider {
                 this.fileItems.push({
                     id: `file:${uri.toString()}`,
                     label: fileName,
-                    description: relativePath,
+                    // Match the workspace-qualified path shown in the search panel.
+                    description: vscode.workspace.asRelativePath(uri, true),
                     detail: uri.fsPath,
                     type: SearchItemType.File,
                     uri: uri,
@@ -163,7 +164,6 @@ export class FileSearchProvider implements SearchProvider {
         const parts = relativeFilePath.split(/[\/\\]/).filter(Boolean);
 
         for (let depth = 1; depth < parts.length; depth++) {
-            const directoryPath = parts.slice(0, depth).join('/');
             const uri = vscode.Uri.joinPath(workspaceFolder.uri, ...parts.slice(0, depth));
             const key = uri.toString();
 
@@ -175,7 +175,7 @@ export class FileSearchProvider implements SearchProvider {
             this.fileItems.push({
                 id: `directory:${key}`,
                 label: parts[depth - 1],
-                description: directoryPath,
+                description: vscode.workspace.asRelativePath(uri, true),
                 detail: uri.fsPath,
                 type: SearchItemType.File,
                 uri,
